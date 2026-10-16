@@ -1,0 +1,485 @@
+^†^These authors contributed equally to this work.
+
+# Introduction {#sec-intro}
+
+Causal inference aims at evaluating the effect of a treatment on an outcome in a specified population. In evidence-based medicine, randomized controlled trials (RCTs) are considered the gold standard for this task, providing unconfounded estimates of average treatment effects (ATEs) that drive high-stakes clinical and regulatory decisions [@SanteGouv]. However, individual trials often suffer from limited sample sizes and restrictive eligibility criteria, limiting their precision and external validity [@rothwell2005external]. Combining information across multiple studies mitigates these limitations, making evidence synthesis through meta-analysis the pinnacle of the clinical evidence hierarchy [@barratt1999users; @evans2003hierarchy]. Meta-analysis can be conducted using either aggregate data (AD) or individual participant data (IPD). While AD meta-analysis is convenient, IPD meta-analysis offers greater statistical flexibility, enabling covariate adjustment, harmonization of outcomes, and rigorous handling of site effects [@riley2010meta; @burke2017meta]. Unfortunately, pooling IPD in a centralized repository is frequently prohibited by privacy regulations, institutional governance, and logistical barriers, forcing researchers to rely on less informative study-level summaries.
+
+Federated learning [@mcmahan2017communication] offers a decentralized paradigm to bypass these data-sharing bottlenecks. In a federated network, algorithms are trained collaboratively through the exchange of intermediate aggregate quantities, while the underlying individual-level observations remain local. Recently, this paradigm has been extended to *federated causal inference* [@xiong2023federated; @khellaf2024federated], enabling the statistical benefits of an IPD meta-analysis without pooling raw data. Under suitable conditions, federated procedures can output causal effect estimates and variances that match or approximate the results obtained from centrally pooled analyses.
+
+Despite the theoretical maturity of federated causal inference, a major barrier to its widespread adoption is the lack of practical software implementations. While there exist deployment platforms for standard federated machine learning tasks [@he2020fedml; @ziller2021pysyft], there is not for its causal inference methods, hindering their diffusion among researchers.
+
+To bridge this gap, we propose a practical deployment of federated causal inference using `DataSHIELD` [@wolfson2010datashield; @gaye2014datashield]. `DataSHIELD` is an established R-based framework engineered to perform privacy-preserving distributed analyses. It allows participating studies to execute local computations and return only disclosure-controlled summary quantities to a central analysis server. In this article, we extend the `DataSHIELD` ecosystem by introducing methods for the federated estimation of ATEs across multiple RCTs, providing researchers with a secure, deployable tool to conduct covariate-adjusted IPD meta-analyses without ever centralizing participant-level records.
+
+## Contributions.
+
+We introduce two companion R packages, `dsFedAte` (server-side) and `dsFedAteClient` (client-side), implementing within DataSHIELD the federated ATE estimator of @khellaf2024federated using decentralized IPD from multiple RCTs. The implementation builds on native DataSHIELD functions and allows individual-level patient data to remain at their respective sites. Unlike the iterative optimization scheme proposed by @khellaf2024federated, we introduce a one-shot federated procedure, better suited to DataSHIELD's `dsBase` package and more communication-efficient for moderate covariate dimensions. By aggregating local covariance matrices and covariate--outcome cross-products, it estimates the outcome-model parameters in a single communication round and yields the same ATE as the centralized pooled estimator.
+
+We provide two methodological contributions, beyond the implementation. First, we derive the asymptotic variance in the general setting, accounting for heterogeneous covariate distributions and site effects. We express this variance as a sum of locally computable contributions that can be aggregated centrally, enabling federated variance estimation and the construction of confidence intervals. Second, we extend the known results of linear adjustment in a single RCT to the multiple RCTs setting. We also prove the consistency and asymptotic normality of the estimator even when the outcome models are estimated with misspecified linear regressions ([Proposition 2](#sec-prop-misspecified_model_consistent_ate)).
+
+# Background and Problem Statement {#sec-background}
+
+## Multicenter Causal Inference {#sec-causal}
+
+We represent each individual by a realization of the random tuple $(H, X, A, Y)$, where $H \in [K]$ denotes the study/site/center indicator, $A \in \{0,1\}$ the binary treatment indicator, $X$ a $d$-dimensional vector of pre-treatment covariates, and $Y$ the observed outcome. Following the potential outcomes framework of [@rubin1978bayesian], we posit the existence of two counterfactual random variables $Y^0$ and $Y^1$, representing the outcomes an individual would have experienced under treatment $0$ or $1$, respectively. We link these potential outcomes to the observed outcome $Y$ through the Stable Unit Treatment Value Assumption (SUTVA), which requires that there is no interference between individuals and no hidden versions of treatment.
+
+::: {#sec-ass-sutva .assumption}
+**Assumption 1** (SUTVA). *$Y = AY^1 + (1-A)Y^0$. *
+:::
+
+To compare two treatments, one typically specifies a contrast function $\Phi$ and targets $\Phi(\mathbb{E}[Y^1], \mathbb{E}[Y^0])$. In this work, we focus on the risk difference $\Phi(x, y) = x - y$, yielding the **estimand of interest**: $$\tau:=\mathbb{E}[Y^1 - Y^0]. \tag{ATE}$$
+
+In practice, for any given individual, only one of the two potential outcomes $Y^1$ or $Y^0$ is ever observed, a fact known as the *fundamental problem of causal inference*. The goal is nonetheless to estimate $\tau$ from the observable quantities $(H, X, A, Y)$, which in general requires imposing assumptions on the joint distribution of $(H, X, A, Y^1, Y^0)$. Beyond SUTVA, we adopt the following conditions on the treatment assignment mechanism.
+
+::: {#sec-ass-rcts .assumption}
+**Assumption 2** (RCT within sites). *Treatment is randomised within each site: $A \perp\!\!\!\perp (Y^{0},Y^{1}) \mid H.$*
+:::
+
+::: {#sec-ass-local_overlap .assumption}
+**Assumption 3** (Positivity). *For every $k\in[K]$, $0<p_k:=\Pr(A=1\mid H=k)<1$.*
+:::
+
+Denote by $P_k$ the covariate distribution in study $k$, and set $\rho_k = P(H=k)$. [Assumptions 1 to 3](#sec-ass-sutva) together yield the identification formula []{#eq-g_formula} $$\tau = \sum_k \rho_k\,\mathbb{E}_{P_k}\!\left[\mu_1(X, k) - \mu_0(X, k)\right]. \tag{G-formula}$$ where the *response function* $\mu_a$, for $a \in \{0,1\}$, is defined as $$
+    \mu_a(x, k) := \mathbb{E}[Y \mid H=k,\, X=x,\, A=a].
+$$ {#eq-regress_fun}
+
+To estimate $\tau$ via [(G-formula)](#eq-g_formula) from the observed data $\mathcal{D}=(H_i, X_i, A_i, Y_i)_{i=1}^n$, we proceed in two steps: we first fit estimators $\hat{\mu}_1$ and $\hat{\mu}_0$ on the data, and then plug them into [(G-formula)](#eq-g_formula). For each site $k$, define the local treatment effect estimate $$
+\hat{\tau}_k := \frac{1}{n_k}\sum_{i:\, H_i = k} \big[\hat{\mu}_1(X_i, k) - \hat{\mu}_0(X_i, k)\big],
+$$ {#eq-tau_k}
+
+where $n_k := \#\{i : H_i = k\}$. The overall estimator is then the weighted average $$
+\hat{\tau} = \sum_k \frac{n_k}{n} \cdot \hat{\tau}_k.
+$$ {#eq-pluggin_gformula}
+
+Throughout this work, $\hat{\mu}_1$ and $\hat{\mu}_0$ are specified as **linear models**, that is, for $a\in \lbrace 0,1\rbrace,$ $$\hat{\mu}_a(x,k) = \hat{d}_a^\top k
+                         + \hat{\beta}_a^\top x,$$ where $$
+        ( \hat{d}_a,\, \hat{\beta}_a)
+        = \operatorname*{argmin}_{ d,\, \beta}
+          \sum_{i=1}^n
+          \bigl(Y_i  - d^\top H_i - \beta^\top X_i\bigr)^2\mathbb{1}_{[A_i=a]},
+$$ {#eq-linearReg_optim}
+
+with $H$ encoded as a one-hot vector.
+
+### Linear Outcome Model
+
+The tutorial examples in @sec-examples all rely on a linear outcome model, implying that $\hat{\mu}_1$ and $\hat{\mu}_0$ are correctly specified. The function `dsFedAteClient::ds.EstimateAte` provides two optional logical parameters, `study_effects` and `heterogeneous`, which encode assumptions about the outcome model. Setting `study_effects` to `FALSE` imposes the constraint $\mu_a(\cdot,k)=\mu_a(\cdot,l)$ for all $k,l\in [K]$, while setting `heterogeneous` to `FALSE` assumes that the covariate distributions satisfy $P_k= P_l$ for all $k,l\in [K]$. Under linearity, the outcome model takes the form $$
+    Y^a = d_a^\top H+\beta_a^\top X+\varepsilon_a,
+$$ {#eq-linear_outcome}
+
+where $H \in \{0, 1\}^K$ is treated as a one-hot encoded vector (by a slight abuse of notation), $\mathbb{E}[\varepsilon_a|X,H]=0$. The *no study effects* assumption corresponds to $$
+    Y^a = c_a+\beta_a^\top X+\varepsilon_a
+$$ {#eq-linear_outcome_noStudy}
+
+so that to obtain $\hat{\mu}_1$ and $\hat{\mu}_0$, $Y$ is regressed on $X$ alone.
+
+![The directed acyclic graph representing the causal structure of the fully heterogeneous setting, with heterogeneous populations and a center effect. Setting `study_effects` to `FALSE` amounts to removing the dashed arrow from $H$ to $Y$, while setting `heterogeneous` to `FALSE` corresponds to removing the dotted arrow from $H$ to $X$.](figures/fig-dag_het_center.png){#fig-dag_het_center fig-alt="Causal DAG with four nodes: H in the top-left, X in the top-right, A in the bottom-left, Y in the bottom-right. Solid arrows run from H to A, A to Y, and X to Y. A dotted arrow runs from H to X; a dashed arrow runs diagonally from H to Y."}
+
+::: {#sec-prop-asymp_var .proposition}
+**Proposition 1** (Variance, proved in [Appendix A](#sec-app-proof_asymp_var)). Let $Z = (H^\top, X^\top)^\top$ and $\theta_a = (d_a^\top, \beta_a^\top)^\top$. Under Model @eq-linear_outcome, and homoscedastic errors $\mathbb{V}(\varepsilon_a \mid Z) = \sigma_a^2$, $\hat{\tau}$ satisfies $\sqrt{n}(\hat{\tau} - \tau) \xrightarrow{d} \mathcal{N}(0, V)$, with $$
+    V = \sigma_1^2 \mathbb{E}[Z]^\top M_1^{-1} \mathbb{E}[Z] + \sigma_0^2 \mathbb{E}[Z]^\top M_0^{-1} \mathbb{E}[Z] + \mathbb{V}(Z^\top \Delta),
+$$ {#eq-variance_heterogeneous_studyEffect}
+
+where $\Delta = \theta_1 - \theta_0$, $M_a = \mathbb{E}[\mathbb{1}(A=a) ZZ^\top]$. If we further assume no study effects and fit outcome models on $X'=(1,X^\top)^\top$, we get $$
+    V = \sigma_1^2 \mathbb{E}[X']^\top \tilde{M}_1^{-1} \mathbb{E}[X'] + \sigma_0^2 \mathbb{E}[X']^\top \tilde{M}_0^{-1} \mathbb{E}[X'] + \mathbb{V}((\beta_1 - \beta_0)^\top X),
+$$ {#eq-variance_heterogeneous_NostudyEffect}
+
+where $\tilde{M}_a = \mathbb{E}[\mathbb{1}(A=a) X' {X'}^\top]$. Finally, if the distribution of covariates is homogeneous across studies, $$
+    V = \frac{\sigma_1^2}{p} + \frac{\sigma_0^2}{1-p} + \mathbb{V}((\beta_1 - \beta_0)^\top X).
+$$ {#eq-variance_homogeneous}
+:::
+
+A notable robustness result [@lin2013agnostic] shows that in an RCT, even when the true relationship between covariates and potential outcomes is nonlinear, fitting separate linear models for $\hat{\mu}_a$ and using them to impute potential outcomes still yields a consistent---though only asymptotically unbiased---estimate of the average treatment effect $\tau$. However, this result applies to a single RCT, whereas in our setting the full pooled data is not an RCT---only the data within each study is. This distinction necessitates a generalization of the above result, the proof of which is deferred to the appendix.
+
+::: {#sec-prop-misspecified_model_consistent_ate .proposition}
+**Proposition 2** (Asymptotic normality with misspecified linear outcome models, proved in [Appendix C](#sec-proof-misspecified_model_consistent_ate)). *Let the empirical G-formula estimator $\hat{\tau}$ @eq-pluggin_gformula be constructed using the arm-specific OLS predictions $\hat{\mu}_a(X, H) = \hat{d}_a^\top H + \hat{\beta}_a^\top X$, where $H$ is a vector of one-hot encoded site indicators and $(\hat d_a, \hat\beta_a)$ obtained as in @eq-linearReg_optim. Under [Assumption 2](#sec-ass-rcts) and [Assumption 3](#sec-ass-local_overlap), and $X\perp\!\!\!\perp A\mid H$, even if the true conditional expectations are non-linear in $X$, $\hat{\tau}$ satisfies$$\sqrt{n}(\hat{\tau} - \tau) \xrightarrow{d} \mathcal{N}(0, V^*),$$where $V^*$ is the asymptotic variance. Furthermore, $V^*$ is less than or equal to the asymptotic variance of the unadjusted stratified difference-in-means estimator.*
+:::
+
+::: remark
+*In particular, this result establishes that when the outcome is binary, one may still use a linear regression to estimate $\hat{\mu}_a$ as a means to estimate $\tau$. Moreover, the second part of the proposition justifies the sole focus on the G-formula throughout the rest of the article.*
+:::
+
+::: remark
+*This extends the asymptotic guarantees of @wager2024causal to multi-site settings. While @liu2020regression derive a similar variance bound in a stratified RCT, they assume a finite population and use a single pooled and fully interacted regression. In contrast, we use a super-population framework and prove that arm-specific G-formula regressions achieve this bound including site indicators, avoiding centering and interactions.*
+:::
+
+## Federated Learning and the DataSHIELD Architecture {#sec-federated}
+
+In multicenter settings, collaboration can increase sample size and population diversity, but legal, privacy, competitive, or logistical constraints may prevent centralizing individual-level data.
+
+Federated computing addresses this by keeping raw observations local while exchanging only aggregated information. It includes federated analytics, which enables collaborative data analysis; and federated learning, which trains a global model without centralizing sites' raw data. Thus, federated learning is a set of statistical and optimization methods for learning shared models under data-sharing constraints.
+
+Federated architectures can be organized around a star-shaped graph, known as *client--server* architecture, where sites communicate through a central coordinator, or a fully decentralized architecture, such as peer-to-peer learning, where sites communicate directly without a central server. Finally, two main settings related to the number of participating sites $K$ are distinguished [@kairouz2021advances]. In cross-device settings, a large number of intermittently available devices, such as smartphones, collaborate. In a *cross-silo* setting, collaboration is performed by a smaller number of stable organizations, such as hospitals, companies, or research centers.
+
+### DataSHIELD
+
+DataSHIELD is an open-source platform for privacy-aware federated analysis of sensitive individual-level data, built around the principle of "taking the analysis to the data, not the data to the analyst" [@gaye2014datashield]. It follows a central client--server architecture (see @fig-arch-datashield_packages): an analyst interacts through a central client, which sends approved commands to servers located at participating institutions, where the data remain stored locally [@wilson2017datashield]. Note that this terminology is reversed in the federated learning literature, where the central coordinating entity is typically called the *server* and participating institutions are referred to as *clients*. DataSHIELD was initially developed mainly for federated analytics, with sites returning disclosure-controlled summary statistics, but its ecosystem now also includes statistical tasks such as fitting distributed linear regressions.
+
+Its architecture combines server-side R packages, such as `dsBase`, installed within each institution's infrastructure, with client-side packages, such as `dsBaseClient`, through which the analyst submits approved analysis commands. Each site's data are typically managed through an **Opal** repository, which restricts execution to whitelisted functions and returns only disclosure-controlled outputs. Communication between the client and institutional servers is authenticated and encrypted, allowing distributed analyses to be centrally orchestrated while individual-level data remain behind each site's firewall.
+
+Server-side functions process the data locally and return only non-disclosive summaries --- for example, score vectors and information matrices for a generalised linear model --- which the client combines to produce the final result. The procedure is mathematically equivalent to analysing all data in a single database, while respecting the federated constraint. The present package accesses DataSHIELD through the package `DSI` [@marcon2025dsi][,]{style="color: blue"} an abstraction layer that defines a common interface for connecting to DataSHIELD-compliant data repositories regardless of their back-end implementation (e.g. Opal, DSLite).
+
+### Disclosure controls.
+
+In DataSHIELD, privacy is understood primarily as a disclosure control. It prevents the execution of functions whose outputs may reveal individual-level information or enable re-identification or inference attacks. It is enforced operationally at the server side through two mechanisms. First, each data server operates at a configurable *privacy control level* that determines which server-side functions are permitted [@datashield_disclosure_control]. Five levels are defined, ranging from `"permissive"` (no restrictions) through `"avocado"` (blocks known subsetting attacks), `"banana"` (blocks known inference attacks), and `"carrot"` (blocks both some subsetting and some inference attacks) to `"non-permissive"` (blocks all known attacks). The default is `"banana"`, which permits the subsetting and GLM operations used by this package. Second, a set of numeric disclosure thresholds --- retrieved via `dsBase::listDisclosureSettingsDS()` --- impose additional constraints on every result returned. The two most relevant to this package are:
+
+-   `nfilter.subset`: the minimum number of rows a dataset must contain before any result is returned (default: 3).
+
+-   `nfilter.glm`: the maximum ratio of model parameters to observations; GLMs that exceed this ratio relative to the local arm size are blocked (default: 0.33, requiring at least ${\sim}\,3$ observations per parameter).
+
+Further safeguards, such as suppression of contingency-table cells with low counts and omission of extrema from quantile functions, are built directly into individual server-side functions [@gaye2014datashield; @wilson2017datashield].
+
+### Local simulation with DSLite. {#sec-dslite}
+
+The `DSLite` package [@marcon2025dslite] emulates a multi-server DataSHIELD deployment on a single machine by running lightweight virtual servers inside the local R session. All examples in this article use DSLite: they are fully self-contained and reproducible without institutional server access. In a real multi-site study the analyst would replace the DSLite login configuration with credentials for the participating institutional servers; the analysis code is otherwise identical.
+
+## Estimation goals and method {#sec-problem}
+
+We now describe the outputs of the packages. As in @sec-causal, let $\mathcal{D}=(H_i,X_i,A_i,Y_i)_{i=1}^n$ denote a set of observations and $(Y_i^1,Y_i^0)_{i=1}^n$ the corresponding potential outcomes, all satisfying [Assumptions 1 to 3](#sec-ass-sutva) for every $i$. For each site $k$, define the local data set $\mathcal{D}_k=\lbrace (H,X,A,Y)\in \mathcal{D}: H=k\rbrace$. As in @sec-federated, suppose that the data sets $\mathcal{D}_k$ are distributed across $K$ sites and that all statistical analysis must be conducted without pooling individual-level records.
+
+[**Goal.**]{style="font-weight:700"} We aim to compute the following quantities using only functions from `dsBaseClient` without individual-level observations being sent out of their site:
+
+1.  The estimator $\hat{\tau}$ of the ATE defined in @eq-pluggin_gformula, with $\hat{\mu}_1$ and $\hat{\mu}_0$ predicted as linear models;
+
+2.  A variance estimate $\hat V$ of $V$ in @eq-variance_heterogeneous_studyEffect, yielding a 95 % confidence interval $\hat\tau \pm 1.96 \hat {V}^{1/2}$.
+
+[**Method.**]{style="font-weight:700"} We obtain estimates of $\tau$ and $V$ through the following two steps:
+
+1.  The coefficients $(\hat{d}_a, \hat{\beta}_a)$ defining the outcome models $\hat{\mu}_0$ and $\hat{\mu}_1$ --- that is, the solutions to @eq-linearReg_optim --- are estimated in a federated manner using `ds.glm` from the `dsBaseClient` package. This function implements a federated variant of the Iteratively Reweighted Least Squares (IRLS) algorithm.
+
+2.  The client broadcasts the estimated coefficients $(\hat{d}_a, \hat{\beta}_a)$ to all servers. Each server $k$ then computes its local treatment effect estimate $\hat{\tau}_k$ (see @eq-tau_k), together with the aggregate summaries needed for the variance estimation (see [Appendix B](#sec-app-variance) for further details), and returns these quantities to the client for final aggregation.
+
+::: remark
+*Estimating $\hat{\mu}_a$ for $a\in\{0,1\}$ requires solving @eq-linearReg_optim across sites without pooling individual-level data. Unlike the iterative federated gradient descent approach of @khellaf2024federated, we use DataSHIELD's `ds.glm`, which implements federated iteratively reweighted least squares (IRLS). For linear models, IRLS converges in a single iteration by aggregating local score vectors and information matrices. These quantities are already computed by `ds.glm`, providing the analyst with the global Hessian at no additional communication cost and thus facilitating variance estimation. See [Appendix D](#sec-app-IRLS_vs_FedAvg) for details and a comparison with federated gradient descent.*
+:::
+
+We now describe how to estimate $V$ in @eq-variance_heterogeneous_studyEffect, @eq-variance_heterogeneous_NostudyEffect, @eq-variance_homogeneous using locally computable quantities that can be aggregated centrally. We first consider the general setting with heterogeneous covariate distributions and site effects (@eq-variance_heterogeneous_studyEffect).
+
+-   Variance of the predicted treatment effects, i.e., $\mathbb{V}(Z^\top \Delta)$. Let $\mathcal{I}_k=\{i:H_i=k\}$, $\bar Z_k=n_k^{-1}\sum_{i\in\mathcal I_k}Z_i$ and $$
+    S_k=\sum_{i\in\mathcal I_k}\left[\hat\Delta^\top(Z_i-\bar Z_k)\right]^2.
+$$ {#eq-s_k}
+
+The variance $\mathbb{V}(Z^\top\Delta)$ is estimated by $$\widehat{\mathbb{V}(Z^\top\Delta)}
+    =\frac{1}{n-1}\left[\sum_{k=1}^K S_k+\sum_{k=1}^K n_k(\hat\tau_k-\hat\tau)^2\right],$$ where $\hat\tau_k=\hat\Delta^\top\bar Z_k$ and $\hat\tau=n^{-1}\sum_k n_k\hat\tau_k$. Since these estimates are already available, only the $S_k$ need to be transmitted.
+
+-   The vector $\mathbb E[Z]$ is estimated by $\bar Z=\frac{1}{n}\sum_{k=1}^K n_k\bar Z_k$ Thus, only site-specific covariate means and sample sizes are required.
+
+-   Residual variances. For each treatment arm $a\in\{0,1\}$, we estimate $$\hat\sigma_a^2=\frac{1}{n^{(a)}-(K+d)}
+    \sum_{k=1}^K\sum_{i\in\mathcal I_k}
+    \mathbb{1}(A_i=a)\left(Y_i-\hat\mu_a(X_i,H_i)\right)^2.$$ If the residual variances are assumed equal across treatment arms, we instead use $$\hat\sigma^2=\frac{1}{n-2(K+d)}
+    \sum_{a=0}^1\sum_{k=1}^K\sum_{i\in\mathcal I_k}
+    \mathbb{1}(A_i=a)\left(Y_i-\hat\mu_a(X_i,H_i)\right)^2.$$ The required residual sums of squares and degrees of freedom are already provided by `ds.glm()`.
+
+-   Inverse Gram matrices. We estimate $M_a^{-1}$ by $\widehat M_a^{-1}=nG_a$, where $$\label{eq}
+    G_a=\left(\sum_{k=1}^K\sum_{i\in\mathcal I_k}
+    Z_iZ_i^\top\mathbb{1}(A_i=a)\right)^{-1}.$$ The matrices $G_a$ are directly available from `ds.glm()` without additional communication.
+
+Without site effects (as in @eq-variance_heterogeneous_NostudyEffect), the same estimators apply by replacing $Z_i$ with $X_i'=(1,X_i^\top)^\top$ and $K+d$ with $d+1$. Under homogeneous covariate distributions and without site effects (@eq-variance_homogeneous), the inverse Gram matrices and mean covariates are no longer needed for the residual-variance terms. Only the pooled treatment proportion $p$, estimated as $\hat p=n^{-1}\sum_{k=1}^K n_k^{(1)}$ is required.
+
+This represents a novel contribution beyond [@khellaf2024federated], and its mathematical derivations and implementation in DataSHIELD are detailed in [Appendix B](#sec-app-variance).
+
+# Package Design {#sec-packages}
+
+The federated computation of the estimator defined in @eq-pluggin_gformula and described in is realized through the DataSHIELD interface using two companion R packages: `dsFedAteClient`, which runs on the analyst's machine, and `dsFedAte`, which is installed on each participating data server. This follows the standard two-package architecture imposed by `DataSHIELD`: only the server-side package has direct access to individual-level data, while the analyst communicates with the participating servers exclusively through the aggregate interface provided by the `DSI` package [@marcon2025dsi].
+
+![Two-package architecture. `dsFedAteClient` runs on the analyst’s machine; `dsFedAte` is installed on each participating data server. Solid arrows are analyst-to-server queries (`DataSHIELD` aggregate or assign calls); dashed arrows are the aggregate summaries returned to the analyst.](figures/fig-arch-datashield_packages.png){#fig-arch-datashield_packages fig-alt="Diagram with the analyst's machine at the top, labelled dsFedAteClient and containing the call ds.EstimateAte(). Below is a group of K server boxes (Server 1, Server 2, up to Server K), each hosting dsFedAte and a local dataset D_k. Solid arrows run from the client down to each server (aggregate or assign calls); dashed arrows run from each server back up (aggregate summaries returned). A legend in the top-right distinguishes the two arrow styles."}
+
+## Client package: `dsFedAteClient` {#sec-client-package}
+
+To estimate treatment effects from decentralized RCT data, the analyst only needs to call a single function, `ds.EstimateAte()`, specifying the treatment, outcome, and covariate variables, as well as the assumptions regarding covariate heterogeneity and site effects. Missing data are not currently supported. The function is supported internally by several unexported helpers: `.add_study_id`, `.check_args()`, `.check_datasources()`, `.check_glm_validity()`, `.compute_variance()`, `.localAte()`).
+
+### Pipeline Overview {#sec-overview}
+
+DataSHIELD distinguishes between two types of functions: *assign* functions, which perform modifications on the server side without returning data to the analyst, and *aggregate* functions, which return privacy-safe summaries to the analyst. Using `dsFedAteClient`, the analyst issues a single call to `ds.EstimateAte()`; internally, this triggers three kinds of DataSHIELD operations against each data server:
+
+1.  one *assign* call to the server-side function `addStudyIdDS()` from the `dsFedAte` package, issued by the client-side function `.add_study_id` (only when `study_effects = TRUE`), corresponding to the outcome model defined in @eq-linear_outcome. Since the regression requires a site indicator $H$, and each server only has access to its own site's data, this indicator is implemented locally as $K-1$ dummy columns, appended---with study 1 as the reference level---to a new server-side data frame.
+
+2.  two *assign* calls to `ds.dataFrameSubset()` from `dsBaseClient`, splitting the data into two arm-specific server-side data frames used in the subsequent federated linear regressions to compute $\hat{\mu}_0$ and $\hat{\mu}_1$.
+
+3.  two *aggregate* calls to `ds.glm()` from `dsBaseClient`, fitting the federated arm-specific linear models and returning the estimated coefficient vectors $(\hat{d}_0, \hat{\beta}_0)$ and $(\hat{d}_1, \hat{\beta}_1)$ that define $\hat{\mu}_0$ and $\hat{\mu}_1$. When `compute_variance && heterogeneous` is `TRUE`, `viewVarCov = TRUE` is additionally passed to `ds.glm()`, which also returns estimates of the matrices $M_a^{-1}$ or $\tilde{M}^{-1}$ defined in [Proposition 1](#sec-prop-asymp_var), needed for the variance estimation -- see the matrices $G_a$ defined in @eq-Gram_matrices in [Appendix B](#sec-app-variance) for further details.
+
+4.  one *aggregate* call to `localAteDS()` from the `dsFedAte` package --- issued by the client-side function `.localAte()` --- which broadcasts $(\hat{d}_0, \hat{\beta}_0)$ and $(\hat{d}_1, \hat{\beta}_1)$ to each server and returns the site-specific estimates $\hat{\tau}_k$ along with aggregated local summaries, from which the analyst assembles the global estimate $\hat{\tau}$ and its variance $\hat{V}(\hat{\tau})$.
+
+Both the first *assign* call and the last of these *aggregate* calls reach into the server package `dsFedAte`. The remaining steps are delegated to the reference `DataSHIELD` packages `dsBase` and `dsBaseClient`.
+
+### Arguments
+
+The function `ds.EstimateAte` takes nine arguments. The first five specify the server connections (`datasources`) and the string identifiers for the data (`base_name`) and variables of interest: the outcome $Y$ (`outcome_name`), the treatment $A$ (`treatment_name`), and the covariates $X$ (`covariate_names`). The four variable identifiers are required. The `datasources` argument is optional; if omitted, the function automatically searches for active connections. The remaining four arguments are Boolean options that control variance estimation and outcome modeling assumptions. These are detailed in @tbl-toggles-draft.
+
+::: {#tbl-toggles-draft tbl-cap="Boolean options of `ds.EstimateAte()`."}
+
+::: {.content-visible when-format="html"}
+  Argument                 Default   Effect
+  ------------------------ --------- ------------------------------------------------------------
+  `compute_variance`       `TRUE`    If `TRUE`, returns variance and 95% CI.
+  `heterogeneous`          `TRUE`    If `TRUE`, computes the variance using @eq-variance_heterogeneous_studyEffect or @eq-variance_heterogeneous_NostudyEffect according to whether `study_effects` is `TRUE` or `FALSE`, passing `viewVarCov = TRUE` to `ds.glm()` and additionally requiring each server to return its column sums. If `FALSE`, computes the variance using @eq-variance_homogeneous -- see [Appendix B](#sec-app-variance) for further details.
+  `heteroscedastic_arms`   `FALSE`   If `TRUE`, $\sigma_1^2$ and $\sigma_2^0$ are assumed to differ and are estimated separately from the arm-specific residual sums of squares. If `FALSE`, the residual sums are pooled and combined after appropriate rescaling. -- see [Appendix B](#sec-app-variance) for further details.
+  `study_effects`          `FALSE`   If `TRUE`, adds $K-1$ integer study dummies to the design matrix on each server via the server-side function `addStudyIdDS()`, invoked by the client-side function `.add_study_id`.
+:::
+
+::: {.content-visible when-format="pdf"}
+```{=latex}
+\begin{tabularx}{\linewidth}{@{}p{0.22\linewidth}p{0.10\linewidth}X@{}}
+\toprule
+Argument & Default & Effect \\
+\midrule
+\texttt{compute\_variance} & \texttt{TRUE} & If \texttt{TRUE}, returns variance and 95\% CI. \\[4pt]
+\texttt{heterogeneous} & \texttt{TRUE} & If \texttt{TRUE}, computes the variance using Equation~(\ref{eq-variance_heterogeneous_studyEffect}) or Equation~(\ref{eq-variance_heterogeneous_NostudyEffect}) according to whether \texttt{study\_effects} is \texttt{TRUE} or \texttt{FALSE}, passing \texttt{viewVarCov = TRUE} to \texttt{ds.glm()} and additionally requiring each server to return its column sums. If \texttt{FALSE}, computes the variance using Equation~(\ref{eq-variance_homogeneous}) --- see \hyperref[sec-app-variance]{Appendix~B} for further details. \\[4pt]
+\texttt{heteroscedastic\_arms} & \texttt{FALSE} & If \texttt{TRUE}, $\sigma_1^2$ and $\sigma_0^2$ are assumed to differ and are estimated separately from the arm-specific residual sums of squares. If \texttt{FALSE}, the residual sums are pooled and combined after appropriate rescaling. --- see \hyperref[sec-app-variance]{Appendix~B} for further details. \\[4pt]
+\texttt{study\_effects} & \texttt{FALSE} & If \texttt{TRUE}, adds $K-1$ integer study dummies to the design matrix on each server via the server-side function \texttt{addStudyIdDS()}, invoked by the client-side function \texttt{.add\_study\_id}. \\
+\bottomrule
+\end{tabularx}
+```
+:::
+
+:::
+
+### Return Values
+
+The result is a named list. Its shape depends on `compute_variance`, and is documented in @tbl-return-client-draft. The vectors `n_k` and `ate_k` store the local sample sizes and local average treatment effects, respectively.
+
+::: {#tbl-return-client-draft}
+  Element      Type     Present when
+  ------------ -------- ---------------------------
+  `ate`        scalar   Always
+  `n_total`    scalar   Always
+  `n_k`        vector   Always
+  `ate_k`      vector   Always
+  `variance`   scalar   `compute_variance = TRUE`
+  `ci_lower`   scalar   `compute_variance = TRUE`
+  `ci_upper`   scalar   `compute_variance = TRUE`
+
+  : Return value of `ds.EstimateAte()`.
+:::
+
+## Server package: `dsFedAte` {#sec-server}
+
+The server package exports exactly two functions, both invoked by the client (analyst) via internal calls within `ds.EstimateAte()`: an *aggregate* function `localAteDS()`, called via `.localAte`, and an *assign* function `addStudyIdDS()`, called via `.add_study_id`.
+
+### `localAteDS()`.
+
+This is the core component of the server package. It is called once per server, after `ds.glm` has converged, with the pooled coefficients $(\hat d_a, \hat \beta_a)$ broadcast back to it. The function then:
+
+1.  Computes the local average treatment effect $\hat{\tau}_k$ as defined in @eq-tau_k.
+
+2.  If `compute_variance = TRUE`, also computes the values $S_k$ defined in @eq-s_k.
+
+3.  If both `compute_variance = TRUE` and `heterogeneous = TRUE`, it also returns the column sums $\sum_{i}(1, X_i^\top)^\top$ of the augmented design matrix, allowing the client to reconstruct the global covariate mean $\bar{X}$ required for the variance estimator in @eq-variance_heterogeneous_NostudyEffect (or its study-augmented counterpart required for @eq-variance_heterogeneous_studyEffect) -- for further details on the federated computation of the variance see [Appendix B](#sec-app-variance).
+
+The returned object is a list. @tbl-return-server-draft lists its elements and the conditions under which each is present. The key privacy observation is that the function never returns any vector of length $n_k$: the server output is a scalar or a vector of length $d+1$. The disclosure risk therefore scales with the covariate dimension rather than with the local sample size.
+
+::: {#tbl-return-server-draft}
+
+| Element | Description | Returned when |
+|:--------|:------------|:--------------|
+| `n_k` | Local sample size $n_k$ | Always |
+| `n_k_1` | Local treated count $n_k^{(1)}$ | Always |
+| `tau_k` | Local ATE $\hat\tau_k$ as in @eq-tau_k | Always |
+| `s_k` | The values $S_k$ as in @eq-s_k. | `compute_variance = TRUE` |
+| `g_raw_k` | Column sums of $(1, X)$: length $d+1$ | `compute_variance` and `heterogeneous` both `TRUE` |
+
+: Elements returned by `localAteDS()`. The number of returned scalars per site is bounded by $3 + d + 2$, independently of $n_k$.
+:::
+
+### `addStudyIdDS()`.
+
+This assign function takes a data frame name, this server's 1-based study index $k$, and the total study count $K$, and appends $K-1$ integer dummy columns `study_id2`, ..., `study_id`$K$ that encode study membership (study 1 is the reference; on server $k>1$, the $k$-th dummy equals $1$ and the rest are $0$). The augmented data frame is returned and stored by the client under a fresh symbol name via `DSI::datashield.assign()`.
+
+::: remark
+<em>The dummies are *integer* columns, not R factors. Locally, every server sees only one value of the study identifier --- its own --- so a factor column would have a single level, and `model.frame()` inside `ds.glm()` would fail with *"contrasts can be applied only to factors with 2 or more levels"*.</em>
+:::
+
+## Data Flow Summary {#sec-dataflow-draft}
+
+@fig-dataflow shows a schema of a single call to `ds.EstimateAte()` in its default configuration (`compute_variance = TRUE`, `heterogeneous = TRUE`, `study_effects = FALSE`). For readability we show only the client and one server.
+
+Two features of the flow are worth emphasising:
+
+1.  **Five server calls, independent of $K$ and $n$.** `ds.EstimateAte()` issues two assigns to split each server's data frame by treatment arm (`ds.dataFrameSubset`), two aggregates to fit the per-arm federated OLS (`ds.glm`, which `dsBaseClient` implements as a federated IRLS -- see [Appendix D](#sec-app-IRLS_vs_FedAvg)), and one aggregate to collect per-site plug-in pseudo-outcome scalars (`localAteDS`); each top-level call may itself expand into several network round-trips inside `dsBaseClient` or `DSI` for validation and disclosure-risk reporting. The two `ds.glm` fits and the final `localAteDS` are the three aggregates that carry estimator-relevant payloads. Enabling `study_effects = TRUE` adds one per-site assign (`addStudyIdDS`). The count depends only on this fixed structure, not on $K$, $n$, or $d$.
+
+2.  **Communication cost scales with $O(d^2)$, not $O(n)$.** The communication cost is dominated by the $(d+1)\times(d+1)$ the matrices $G_a$ defined in @eq-Gram_matrices, one per arm, which are transmitted only when `heterogeneous = TRUE`, together with $O(d)$ column sums per site. All remaining quantities are scalars. Crucially, the local sample sizes $n_k$ influence only numerical precision and have no other impact on bandwidth, so disclosure risk is determined by the covariate dimension $d$ rather than by the number of observations. In the special cases where `compute_variance = FALSE`, or where `compute_variance = TRUE` and `heterogeneous = FALSE`, the protocol only requires scalar exchanges.
+
+![Data flow of a single call to `ds.EstimateAte()` with `compute_variance = TRUE` and `heterogeneous = TRUE`. There are five top-level DataSHIELD calls: two `ds.dataFrameSubset` assigns, two `ds.glm` aggregates (returning coefficients, residual sums as in @eq-sigma_estimator, and the matrices $G_a$ as defined in @eq-Gram_matrices), and one `.localAte` aggregate (returning per-site scalars and a length-$(d+1)$ column-sum vector). Individual outcomes and covariate values never leave the servers.](figures/fig-dataflow.png){#fig-dataflow fig-alt="Two-column sequence diagram. The left column, labelled analyst dsFedAteClient, lists six stacked steps: validate args, ds.dataFrameSubset twice, ds.glm on the treated arm, ds.glm on the control arm, .localAte, and finally assemble tau-hat, V-hat, and the confidence interval. The right column, labelled each data server dsFedAte, shows four boxes connected by arrows to the matching client steps: create arm subsets, return matrices G_1 and residual sums of squares, return matrices G_0 and residual sums of squares, and return n_k, tau-hat_k, S_k, and n_k X-bar_k."}
+
+# Tutorial Examples {#sec-examples}
+
+{{< include tutorial_examples.qmd >}}
+
+# Discussion {#sec-discussion}
+
+In this article, we present a federated implementation of ATE estimation across multiple RCTs to facilitate its practical adoption.
+
+An important extension is the application of the proposed framework to multi-site observational studies. In this setting, identification requires conditional exchangeability, $(Y^1,Y^0)\perp\!\!\!\perp A\mid X,H$, rather than randomization. The current G-formula estimator remains consistent under correctly specified linear outcome models, but the robustness to model misspecification established in [Proposition 2](#sec-prop-misspecified_model_consistent_ate) no longer holds. Extensions of the framework thus include flexible federated estimation of outcome models and propensity scores to enable doubly robust estimators such as augmented inverse probability weighting (AIPW). Currently, DataSHIELD's `dsBase` primarily supports parametric propensity-score estimation through logistic regression via `ds.glm`.
+
+Further extensions include incorporating external control arms (sites with $p_k=0$), which violate site-level positivity and require additional identification assumptions, and generalizing treatment effects to external target populations through federated density-ratio estimation under appropriate transportability and overlap assumptions.
+
+# References {.unnumbered}
+
+::: {#refs}
+:::
+
+# Appendix A: Variance {#sec-app-variance-overview .unnumbered}
+
+## Proof of [Proposition 1](#sec-prop-asymp_var) {#sec-app-proof_asymp_var .unnumbered}
+
+::: proof
+Let $Z = (H^\top, X^\top)^\top$ and $\theta_a = (d_a^\top, \beta_a^\top)^\top$. We prove that under Model @eq-linear_outcome, $\hat{\tau}$ satisfies $\sqrt{n}(\hat{\tau} - \tau) \xrightarrow{d} \mathcal{N}(0, V)$, with the general heteroscedastic asymptotic variance:$$V = \mathbb{E}[Z]^\top M_1^{-1} \Omega_1 M_1^{-1} \mathbb{E}[Z] + \mathbb{E}[Z]^\top M_0^{-1} \Omega_0 M_0^{-1} \mathbb{E}[Z] + \mathbb{V}(Z^\top \Delta),$$where $\Delta = \theta_1 - \theta_0$, $M_a = \mathbb{E}[\mathbb{I}(A=a) ZZ^\top]$, and $\Omega_a = \mathbb{E}[\mathbb{I}(A=a) \varepsilon_a^2 ZZ^\top]$.
+
+First, remark that $\hat{\tau} = \bar{Z}^\top \hat{\Delta}$ and $\tau = \mathbb{E}[Z]^\top \Delta$, where $\bar{Z} = \frac{1}{n}\sum_{i=1}^n Z_i$. Thus, $$\begin{aligned}
+    \sqrt{n}(\hat{\tau} - \tau) &= \sqrt{n} \left( \bar{Z}^\top \hat{\Delta} - \mathbb{E}[Z]^\top \Delta \right) \\ 
+    &= \sqrt{n} \left( \bar{Z}^\top \hat{\Delta} - \bar{Z}^\top \Delta + \bar{Z}^\top \Delta - \mathbb{E}[Z]^\top \Delta \right) \\ 
+    &= \bar{Z}^\top \sqrt{n} ( \hat{\Delta} - \Delta ) + \sqrt{n}(\bar{Z} - \mathbb{E}[Z])^\top \Delta \\ 
+    &= \mathbb{E}[Z]^\top \sqrt{n} ( \hat{\Delta} - \Delta ) + \sqrt{n}(\bar{Z} - \mathbb{E}[Z])^\top \Delta + o_p(1), 
+\end{aligned}$$ where the last equality follows from Slutsky's theorem since $\bar{Z} \xrightarrow{p} \mathbb{E}[Z]$.
+
+Next, we substitute the standard asymptotic linear expansion for the OLS estimators $\hat{\theta}_a$: $$\sqrt{n}( \hat{\theta}_a - \theta_a ) = M_a^{-1} \frac{1}{\sqrt{n}} \sum_{i=1}^n \mathbb{I}(A_i=a) Z_i \varepsilon_{a,i} + o_p(1).$$
+
+Since $\hat{\Delta} - \Delta = (\hat{\theta}_1 - \theta_1) - (\hat{\theta}_0 - \theta_0)$, $\sqrt{n}(\hat{\tau} - \tau)$ rewrites as a scaled sum of independent and identically distributed terms: $$\begin{aligned}
+    \sqrt{n}(\hat{\tau} - \tau) &= \frac{1}{\sqrt{n}} \sum_{i=1}^n \Big[ \mathbb{E}[Z]^\top M_1^{-1} \mathbb{I}(A_i=1) Z_i \varepsilon_{1,i} \\ 
+    &\quad - \mathbb{E}[Z]^\top M_0^{-1} \mathbb{I}(A_i=0) Z_i \varepsilon_{0,i}  + (Z_i - \mathbb{E}[Z])^\top \Delta \Big] + o_p(1).
+\end{aligned}$$ By the Central Limit Theorem, the asymptotic variance $V$ is the variance of a single summand. The covariances between these three terms are zero because the treatment groups are mutually exclusive ($\mathbb{I}(A=1)\mathbb{I}(A=0) = 0$), and Model @eq-linear_outcome is well-specified ($\mathbb{E}[\varepsilon_a \mid Z] = 0$), making the errors uncorrelated with $(Z - \mathbb{E}[Z])^\top \Delta$.
+
+Therefore, the variance of the sum is the sum of the individual variances: $$\begin{aligned}
+    V &= \mathbb{V}\left( \mathbb{E}[Z]^\top M_1^{-1} \mathbb{I}(A=1) Z \varepsilon_1 \right) + \mathbb{V}\left( \mathbb{E}[Z]^\top M_0^{-1} \mathbb{I}(A=0) Z \varepsilon_0 \right) + \mathbb{V}\left( (Z - \mathbb{E}[Z])^\top \Delta \right) \\
+    &= \mathbb{E}[Z]^\top M_1^{-1} \mathbb{E}[\mathbb{I}(A=1) \varepsilon_1^2 Z Z^\top] M_1^{-1} \mathbb{E}[Z] + \mathbb{E}[Z]^\top M_0^{-1} \mathbb{E}[\mathbb{I}(A=0) \varepsilon_0^2 Z Z^\top] M_0^{-1} \mathbb{E}[Z] + \mathbb{V}(Z^\top \Delta) \\ 
+    &= \mathbb{E}[Z]^\top M_1^{-1} \Omega_1 M_1^{-1} \mathbb{E}[Z] + \mathbb{E}[Z]^\top M_0^{-1} \Omega_0 M_0^{-1} \mathbb{E}[Z] + \mathbb{V}(Z^\top \Delta).
+\end{aligned}$$ Under homoscedasticity ($\mathbb{V}(\varepsilon_a \mid Z) = \sigma_a^2$), we have $\Omega_a = \sigma_a^2 M_a$, which simplifies the first two terms to $\sigma_1^2 \mathbb{E}[Z]^\top M_1^{-1} \mathbb{E}[Z]$ and $\sigma_0^2 \mathbb{E}[Z]^\top M_0^{-1} \mathbb{E}[Z]$, recovering the expression in [Proposition 1](#sec-prop-asymp_var). ◻
+:::
+
+# Appendix B: Computing the Variance from Decentralised Data {#sec-app-variance .unnumbered}
+
+This section explains how the variance can be estimated in a decentralised data setting. We begin with the last term, $\mathbb{V}\big((\beta_1-\beta_0)^\top X\big)$, before addressing the two remaining terms.
+
+## The Last Term in the Variance Formula {#sec-app-variance_term1 .unnumbered}
+
+We now focus on estimating $\mathbb{V}\big((\beta_1-\beta_0)^\top X\big)$; the case of $\mathbb{V}(Z^\top\Delta)$ follows by an identical argument. A natural estimator is the sample variance of $z_i = (\hat{\beta}_1 - \hat{\beta}_0)^\top X_i$, given by $$\frac{1}{n-1}\sum_{k=1}^K\sum_{i\in \mathcal{I}_k}\big(z_i-\bar z\big)^2,$$ where $\mathcal{I}_k := \{i : H_i = k\}$ denotes the set of indices belonging to site $k$. However, this expression is not directly amenable to decentralised computation, since the global mean $\bar{z}$ appears inside each local sum and prevents a clean decomposition into site-level quantities. To overcome this, we note that $\bar z = \bar X^\top (\hat{\beta}_1-\hat \beta_0)$, and that by definition $\bar X_k^\top(\hat{\beta}_1-\hat \beta_0) -\bar z = \hat \tau_k -\hat \tau$. Adding and subtracting $\bar X_k^\top(\hat{\beta}_1-\hat \beta_0)$ inside each squared term yields $$\frac{1}{n-1}\sum_{k=1}^K\sum_{i\in \mathcal{I}_k}\big(z_i-\bar z\big)^2
+    = \frac{1}{n-1}\sum_{k=1}^K\sum_{i\in \mathcal{I}_k}
+      \Big(z_i-\bar X_k^\top(\hat{\beta}_1-\hat \beta_0)+ \hat\tau_k - \hat\tau\Big)^2.$$ Expanding the square and grouping terms gives $$= \frac{1}{n-1}\left[ \sum_k S_k + \sum_k n_k (\hat \tau_k -\hat\tau)^2
+      +2\sum_{k=1}^K\sum_{i\in \mathcal{I}_k}
+      \Big(z_i-\bar X_k^\top(\hat{\beta}_1-\hat \beta_0)\Big)
+      \big(\hat\tau_k - \hat\tau\big)\right],$$ where we define the site-level sum of squared residuals $S_k$ as in @eq-s_k. The cross-product term vanishes because the site-level residuals sum to zero: $$\sum_{i\in \mathcal{I}_k}\Big(z_i-\bar X_k^\top(\hat{\beta}_1-\hat \beta_0)\Big) = 0.$$ We therefore obtain the decomposition $$
+    \frac{1}{n-1}\sum_{k=1}^K\sum_{i\in \mathcal{I}_k}\big(z_i-\bar z\big)^2
+    = \frac{1}{n-1}\left[ \sum_k S_k + \sum_k n_k (\hat \tau_k -\hat\tau)^2\right].
+$$ {#eq-variance_lastTerm}
+
+The key insight is that all quantities involved can be computed locally at each site and subsequently aggregated. Although $\hat{\beta}_1$ and $\hat{\beta}_0$ are global parameters, the variance is estimated after fitting the linear models independently using `ds.glm`, and is therefore only computed once the client (analyst) has broadcast the values of $\hat{\beta}_1$ and $\hat{\beta}_0$. The aggregation leading to @eq-variance_lastTerm can thus be carried out in the same round as the aggregation of $\tau_k$, at the cost of each server further sending $S_k$.
+
+#### `DataSHIELD` implementation {.unnumbered}
+
+When `compute_variance = TRUE`, the servers compute $S_k$ within the `localAteDS()` function -- invoked on the server side by the client-side function `.localAte()` -- and broadcast it alongside $n_k$ and $\tau_k$, which are transmitted regardless of the value of `compute_variance`. Upon receiving these values the client/analyst can thus perform the aggregation in @eq-variance_lastTerm. Moreover, the computation of $S_k$ is performed regardless of the values of $\texttt{heterogeneous}$ and `heteroscedastic_arms`.
+
+## The Remaining Terms {.unnumbered}
+
+This section describes how the quantities $\sigma_1^2$, $\sigma_0^2$, $\mathbb{E}[X^\prime]$ and $M_1^{-1}$ appearing in the variance formula @eq-variance_heterogeneous_NostudyEffect are estimated in a federated manner using the two packages, under `heterogeneous = TRUE`. We conclude by outlining the adjustments required to compute the variance formula @eq-variance_heterogeneous_studyEffect.
+
+#### The Gram Matrices. {.unnumbered}
+
+A natural estimator of $M_a^{-1}$ is $$
+    \Big(\frac{1}{n}\sum_{i=1}^n X^\prime_i (X^\prime_i)^\top \mathbb{I}(A_i=a)\Big)^{-1}
+    = n \underbrace{\Big(\sum_{i=1}^n X^\prime_i (X^\prime_i)^\top \mathbb{I}(A_i=a)\Big)^{-1}}_{:= G_a},
+$$ {#eq-Gram_matrices}
+
+so that only $G_a$ and $n$ are needed. The matrix $G_a$ is returned directly by `ds.glm()` when the argument `viewVarCov = TRUE` is set.
+
+#### The Residual Variances. {.unnumbered}
+
+When `heteroscedastic_arms = TRUE`, each arm has its own variance, estimated by $$
+    \hat\sigma_a^2 = \frac{1}{n^{(a)}-(d+1)}
+    \sum_{i=1}^n \big(Y_i-\hat \mu_a(X_i)\big)^2 \mathbb{I}(A_i=a),
+$$ {#eq-sigma_estimator}
+
+where $n^{(a)}$ denotes the number of observations assigned to treatment $a$. No extra communication is required: the list returned by `ds.glm()` contains an element `dev` that is exactly the sum appearing in @eq-sigma_estimator. When `heteroscedastic_arms = FALSE`, a single variance is shared by both arms and is estimated by $$
+    \hat\sigma^2 = \frac{1}{n-2(d+1)}\sum_{a=0}^1\sum_{i=1}^n \big(Y_i-\hat \mu_{a}(X_i)\big)^2\mathbb{I}(A_i=a) .
+$$ {#eq-sigma_estimator_homoscedastic}
+
+#### The Covariate Mean. {.unnumbered}
+
+Each server $k$ transmits is local the covariate sum $n_k \bar X_k$, and the client aggregates these according into $$
+    \frac{1}{n}\sum_k n_k \bar X_k .
+$$ {#eq-avg_covariates}
+
+In the `dsFedAte` package, $\bar X_k$ is computed by `localAteDS()` whenever `heterogeneous = TRUE` and sent back to the client through the client-side function `.localAte()`, which is what invokes `localAteDS()` on the servers.
+
+#### Study Effects {.unnumbered}
+
+The variance formula in @eq-variance_heterogeneous_studyEffect follows the same reasoning. It amounts to substituting $X_i^\prime$ in @eq-Gram_matrices with $Z_i = (H_i^T, X_i^T)$, where $H_i$ is one-hot encoded, replacing $\hat{\mu}_a(X_i)$ in @eq-sigma_estimator and @eq-sigma_estimator_homoscedastic with $\hat{\mu}_a(X_i, H_i)$, and replacing $\bar{X}_k$ in @eq-avg_covariates with $\bar{Z}_k$.
+
+#### Homogeneous Covariates {.unnumbered}
+
+The estimator in @eq-variance_homogeneous admits a straightforward federated implementation. Estimation of $\sigma_a^2$ follows the procedure described above, leaving $p$ as the only remaining quantity to be estimated. A natural estimator is $$\hat p := \frac{1}{n}\sum_{k=1}^K n_k^{(1)},$$ where $n_k^{(1)}$ denotes the local treated count, reported to the client upon invocation of `localAteDS()`.
+
+# Appendix C: Misspecified linear G-formula asymptotic normality {#sec-proof-misspecified_model_consistent_ate .unnumbered}
+
+::: proof
+For each center $k$ and treatment arm $w\in\{0,1\}$, define the index set $\mathcal{C}_k^{(w)}=\{i:H_i=k,\,W_i=w\}$ with cardinality $n_k^{(w)}=|\mathcal{C}_k^{(w)}|$. Let $n_k=n_k^{(0)}+n_k^{(1)}$ denote the total number of individuals in center $k$, and let $\hat{p}_k=n_k^{(1)}/n_k$ be the observed treatment proportion within that center. For any variable $Z\in\{X,Y\}$, write $\bar{Z}_k^{(w)}$ for the sample mean of $Z$ over $\mathcal{C}_k^{(w)}$, and let $\bar{X}_k$ denote the marginal sample mean of $X$ over all individuals in center $k$.
+
+First, as stated in [Lemma 1](#sec-lemma-tau_closedForm), $\hat{\tau}$, defined in @eq-pluggin_gformula, can be expressed as $$
+\hat\tau=\sum_{k=1}^K\frac{n_k}{n}\Big\{\bar Y_k^{(1)}-\bar Y_k^{(0)}
+-\big(\bar X_k^{(1)}-\bar X_k^{(0)}\big)^\top\hat{\bar\beta}_k\Big\},
+$$ {#eq-id}
+
+where $\hat{\bar\beta}_k:=(1-\hat p_k)\hat\beta^{(1)}+\hat p_k\hat\beta^{(0)}$.
+
+Let $( d_w^\star, \beta_w^\star)$, the population counterpart of @eq-linearReg_optim, such that $$
+        ( d_w^\star, \beta_w^\star)
+        = \operatorname*{argmin}_{ d,\, \beta}
+          \mathbb{E}\Big[
+          \bigl(Y  - d^\top H - \beta^\top X\bigr)^2\, \Big|\, W=w\Big],
+$$ {#eq-linearReg_optim_pop}
+
+and $\bar\beta_k=(1-p_k)\beta_1^\star+p_k\beta_0^\star$. Then, we have $$
+    \hat{\tau}-\tau
+    = \underbrace{\sum_{k=1}^K \frac{n_k}{n}
+      \Big\{\big(\bar X_k^{(1)}-\bar X_k^{(0)}\big)^\top
+      \big(\bar \beta_k-\hat{\bar\beta}_k\big)\Big\}}_{=:A_n}
+    +\underbrace{\sum_{k=1}^K\frac{n_k}{n}
+      \Big\{\bar Y_k^{(1)}-\bar Y_k^{(0)}
+      -\big(\bar X_k^{(1)}-\bar X_k^{(0)}\big)^\top
+      \bar\beta_k\Big\}}_{=:B_n}
+    -\tau.
+$$ {#eq-taudiff_split}
+
+Similar to Theorem 1.3 of @wager2024causal, the Huber--White analysis of misspecified linear regression implies that $\hat{\beta}^{(w)} \xrightarrow{p} \beta_w^\star$, provided the design matrix for $(H^\top, X^\top)^\top$ is non-singular. Furthermore, by the Weak Law of Large Numbers, $\hat{p}_k \xrightarrow{p} p_k$. By the Continuous Mapping Theorem, their convex combination converges, meaning $\hat{\bar\beta}_k \xrightarrow{p} \bar\beta_k$, and thus $(\bar \beta_k-\hat{\bar\beta}_k) = o_P(1)$.
+
+Furthermore, under within-center randomization ($X\perp\!\!\!\perp A\mid H$), covariates are exchangeable by treatment groups, so $\bar X_k^{(1)}$ and $\bar X_k^{(0)}$ both converge to $\mathbb{E}[X \mid H=k]$. By the Central Limit Theorem, their difference $\sqrt{n_k}\,(\bar X_k^{(1)}-\bar X_k^{(0)})\to \mathcal N(0,\Sigma_k)$. Because $n_k/n \xrightarrow{p} \mathbb{P}(H=k) > 0$, the global scaled difference $\sqrt{n}\,(\bar X_k^{(1)}-\bar X_k^{(0)})=O_P(1)$. Therefore, $\sqrt{n} A_n = O_P(1) \cdot o_P(1) = o_P(1)$.
+
+Finally, remark that $B_n$ in @eq-taudiff_split has the structure of a **stratified estimator** of the form studied in Theorem 2.1 of @wager2024causal, applied to a modified outcome. Specifically, the transformed potential outcomes and their observed counterpart are defined as $$
+\tilde Y(w)=Y(w)-X^\top\bar\beta_H, \qquad \tilde Y_i(W_i)=Y_i-X_i^\top\bar\beta_{H_i},
+$$ {#eq-transformed_outcome}
+
+and let $\bar{\tilde Y}_k^{(w)}=\frac{1}{n_k}\sum_{i\in \mathcal{C}_k^{(w)}} \tilde Y_i(w)$. With this notation, we have $$B_n -\tau = \sum_{k=1}^K\frac{n_k}{n}\big(\bar{\tilde Y}_k^{(1)}-\bar{\tilde Y}_k^{(0)}\big)-\tau.$$ Theorem 2.1 of @wager2024causal applies directly because the transformed variables $\tilde Y_i(w)$ satisfy the requisite conditions of SUTVA, bounded second moments, and $W \perp\!\!\!\perp (\tilde Y(0), \tilde Y(1)) \mid H$, i.e., $$\begin{aligned}
+\mathbb{E}[\tilde Y(1)-\tilde Y(0)]&=\mathbb{E}[Y(1)-Y(0)]=\tau,\\
+    \mathbb{E}[\tilde Y(1)-\tilde Y(0)\mid H=k]&=\mathbb{E}[Y(1)-Y(0)\mid H=k]=\tau_k.
+\end{aligned}$$ and the tuple $\{(X_i,\,\tilde Y_i(0),\,\tilde Y_i(1),\,W_i)\}$ satisfies all conditions required by that theorem. Therefore, $$\sqrt{n}\left(B_n - \tau\right) \to \mathcal N(0,V^\star),$$ with $V^\star = \mathbb{V}_{P_H}(\tau_H) + \mathbb{E}_{P_H}[V_H]$, where $V_H = \frac{\mathbb{V}(\tilde Y(1) \mid H)}{p_H} + \frac{\mathbb{V}(\tilde Y(0) \mid H)}{1 - p_H}.$ With Slutsky's theorem, this concludes that $$\sqrt{n}(\hat{\tau} - \tau) \xrightarrow{d} \mathcal N(0, V^\star).$$
+
+Finally, the unadjusted stratified difference-in-means estimator $$\hat\tau_\mathrm{DM} = \sum_{k=1}^K \frac{n_k}{n} \left( \bar{Y}_k^{(1)} - \bar{Y}_k^{(0)} \right)$$ has an asymptotic variance of $V_{\mathrm{DM}} = \mathbb{V}_{P_H}(\tau_H) + \mathbb{E}_{P_H}[V_H^{\mathrm{DM}}]$, where $V_H^{\mathrm{DM}} = \frac{\mathbb{V}(Y(1) \mid H)}{p_H} + \frac{\mathbb{V}(Y(0) \mid H)}{1 - p_H}$. By definition of $( d_w^\star, \beta_w^\star)$ in @eq-linearReg_optim_pop, the parameters minimize the mean squared error such that:$$\mathbb{E}\left[ (Y(w) - {d_w^\star}^\top H - X^\top \beta_w^\star)^2 \mid H \right] \leq \mathbb{E}\left[ (Y(w) - \mathbb{E}[Y(w) \mid H])^2 \mid H \right] = \mathbb{V}(Y(w) \mid H).$$ This implies $\mathbb{V}(\tilde Y(w) \mid H) \leq \mathbb{V}(Y(w) \mid H)$, which yields $V^\star \leq V_{\mathrm{DM}}$, concluding the proof. ◻
+:::
+
+::: {#sec-lemma-tau_closedForm .lemma}
+**Lemma 1**. *The estimator $\hat{\tau}$ can be written in the closed form given in @eq-id.*
+:::
+
+::: proof
+The objective in @eq-linearReg_optim splits over centers, $\sum_k\sum_{i\in\mathcal{C}_k^{(w)}}(Y_i-d_k-X_i^\top\beta)^2$, so the optimality condition for $\hat d_k$ is $-2n_k^{(w)}\{\bar Y_k^{(w)}-\hat d_k-(\bar X_k^{(w)})^\top\beta\}=0$, whence $$
+\hat d_k^{(w)}=\bar Y_k^{(w)}-\big(\bar X_k^{(w)}\big)^\top\hat\beta^{(w)} .
+$$ {#eq-CM}
+
+Substituting @eq-CM into $\hat \tau$ yields, $$\begin{aligned}
+\hat \tau
+&=\sum_k\frac{n_k}{n}\Big(\hat d_k^{(1)}-\hat d_k^{(0)}+\bar X_k^\top\big(\hat\beta^{(1)}-\hat \beta^{(0)}\big)\Big) \\
+&=\sum_k\frac{n_k}{n}\Big(\bar Y_k^{(1)}-\bar Y_k^{(0)}+\big(\bar X_k-\bar X_k^{(1)}\big)^\top\hat\beta^{(1)}-\big(\bar X_k-\bar X_k^{(0)}\big)^\top\hat \beta^{(0)}\Big).
+\end{aligned}$$ Since $\bar X_k=\hat p_k\bar X_k^{(1)}+(1-\hat p_k)\bar X_k^{(0)}$ we have $\bar X_k-\bar X_k^{(1)}=-(1-\hat p_k)(\bar X_k^{(1)}-\bar X_k^{(0)})$ and $\bar X_k-\bar X_k^{(0)}=\hat p_k(\bar X_k^{(1)}-\bar X_k^{(0)})$; collecting the slope terms gives @eq-id. ◻
+:::
+
+# Appendix D: IRLS vs FedAvg {#sec-app-IRLS_vs_FedAvg .unnumbered}
+
+Recent approaches to federated causal inference employ varying optimization strategies for nuisance parameter estimation. For instance, @khellaf2024federated estimate regression functions using a multi-shot Federated Averaging (FedAvg) procedure restricted to a single local update per communication round. This configuration corresponds to the standard recursion of centralized gradient descent: $$\theta^{(t+1)} = \theta^{(t)} - \eta \sum_{k=1}^K \frac{n_k}{n} \nabla \mathcal{L}_k(\theta^{(t)}),$$ where $\eta$ is the learning rate, $\theta^{(t)}$ is the global parameter at round $t$, and $\nabla \mathcal{L}_k(\theta^{(t)})$ is the local gradient of the empirical loss computed at site $k$.
+
+In contrast, DataSHIELD implements generalized linear models (via the `ds.glm` function) using a distributed Iteratively Reweighted Least Squares (IRLS) algorithm. In this approach, the central server broadcasts the current parameter estimates at each iteration. Each site then computes local working responses and information matrices based on its local data. The server aggregates these local matrices to compute a Newton-Raphson update: $$\theta^{(t+1)} = \theta^{(t)} - \left( \sum_{k=1}^K \nabla^2 \mathcal{L}_k(\theta^{(t)}) \right)^{-1} \sum_{k=1}^K \nabla \mathcal{L}_k(\theta^{(t)}),$$ where $\nabla^2 \mathcal{L}_k(\theta^{(t)})$ denotes the local Hessian (or empirical Fisher information matrix) evaluated at site $k$. This second-order method typically converges in fewer communication rounds than first-order gradient approaches like FedAvg, at the cost of larger amounts of float exchanged per round ($O(d^2)$).
+
+Furthermore, in the specific context of linear regression with a quadratic loss function, the estimation admits a closed-form solution, enabling a one-shot federated procedure. Each site $k$ computes its local uncentered covariance matrix $M_{k,a} = \sum_{i \in \mathcal{C}_k^{(a)}} Z_i Z_i^\top$ and cross-product vector $\nabla_{k,a} = \sum_{i \in \mathcal{C}_k^{(a)}} Z_i Y_i$ for each treatment arm $a$. The central server then aggregates these sufficient statistics to compute the global OLS estimator: $$\hat\theta_a = \left(\sum_{k=1}^K M_{k,a}\right)^{-1}\left(\sum_{k=1}^K \nabla_{k,a}\right).$$ This one-shot aggregation retrieves the centralized pooled solution without requiring iterative communication. It is equivalent to the FedAvg algorithm limit as the number of communication rounds $T$ goes to infinity.
+
+# Session information {.appendix .unnumbered}
+
+```{r session-info}
+sessionInfo()
+```

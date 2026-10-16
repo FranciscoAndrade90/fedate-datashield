@@ -1,0 +1,838 @@
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>"
+)
+```
+
+```{r libraries, message = FALSE}
+library(dsFedAteClient)
+library(dsFedAte)
+library(DSLite)
+library(MASS)
+```
+
+This section walks through five worked examples of federated Average Treatment Effect
+(ATE) estimation using `dsFedAteClient`. All examples use **DSLite** to emulate the
+federated infrastructure locally — no institutional server access is required.
+In a real deployment, each site must instead run a DataSHIELD-compatible server,
+typically either Opal [@opal] (the reference implementation) or the lightweight
+Armadillo [@cadman2025]; see @datashield_custodians for installation and operational
+guidelines.
+
+From the analyst's perspective, estimating the ATE from decentralised RCT data
+requires a single function call — `ds.EstimateAte()`. Its arguments are the
+connections (`datasources`), the server-side data-frame name (`base_name`), the
+outcome, treatment, and covariate column names (`outcome_name`,
+`treatment_name`, `covariate_names`), and the model switches `heterogeneous`,
+`study_effects`, and `heteroscedastic_arms`. The data at each site must share
+the same data-frame name and column names, and missing values are not supported.
+
+Following the simulation settings of Appendices C.1–C.4 of @khellaf2025federated,
+@sec-homogeneous through @sec-confounding cover progressively richer settings:
+homogeneous covariate distributions; DataSHIELD's privacy controls in action, where
+treatment imbalance triggers the `nfilter.glm` disclosure threshold; heterogeneous
+covariate distributions; and study-level confounding. Each example closes with a
+2000-replication coverage check; the three results are collected in @sec-coverage,
+confirming that the variance formulas in [Proposition 1](#sec-prop-asymp_var) yield confidence intervals
+with nominal 95% coverage across these settings.
+
+## Shared parameters
+
+All examples share the following structural parameters. The intercepts and slopes specified below generate the potential outcomes $Y^{(0)}$ and $Y^{(1)}$ for each individual.
+
+
+```{r shared-params}
+K       <- 5      # number of sites
+d       <- 10     # number of covariates
+c_0     <- -2     # control group intercept
+c_1     <- -1.85  # treatment group intercept
+beta_1  <- seq(-1.75, 0.5, by = 0.25)  # treatment group slope
+beta_0  <- seq(-1.80, 0.0, by = 0.20)  # control group slope
+
+I_d <- diag(d)
+J   <- matrix(1, nrow = d, ncol = d)
+
+outcome_name    <- "Y"
+treatment_name  <- "A"
+covariate_names <- paste0("X", seq_len(d))
+```
+
+## Helpers
+
+Six helpers — `generate_data()`, `centralised_ate()`, `centralised_variance()`, `make_connections()`, `run_coverage()`, and the pair `report_ate()` / `verify_against_centralised()` — are used throughout the examples. The first five are described briefly below; all code is folded by default, click **Show** to expand it.
+
+- **`generate_data()`** generates $K$ RCT datasets from the linear potential-outcomes model (@eq-linear_outcome, or @eq-linear_outcome_noStudy without study effects), covering three options: heterogeneous/homogeneous covariate distributions, presence/absence of study effects ($d_k$), and heteroscedastic/homoscedastic arms corresponding to $\sigma_0 \neq \sigma_1$ and $\sigma_0 = \sigma_1$.
+
+```{r helper-generate}
+#| code-fold: true
+#| code-summary: "Show `generate_data()`"
+generate_data <- function(K, d, n, p_k,
+                          c_0, c_1, beta_0, beta_1,
+                          mu, Sigma,
+                          d_k     = rep(0, K),
+                          sigma_0 = 1.0,
+                          sigma_1 = 1.0,
+                          seed) {
+  set.seed(seed)
+  if (length(n) == 1L)    n     <- rep(n, K)
+  if (!is.list(mu))       mu    <- replicate(K, mu,    simplify = FALSE)
+  if (!is.list(Sigma))    Sigma <- replicate(K, Sigma, simplify = FALSE)
+
+  delta_c <- c_1 - c_0
+  delta_beta  <- beta_1 - beta_0
+
+  data_list <- vector("list", K)
+  Y_0_list  <- vector("list", K)
+  Y_1_list  <- vector("list", K)
+  tau_k     <- numeric(K)
+  for (k in seq_len(K)) {
+    n_k            <- n[k]
+    # covariates
+    X_k            <- mvrnorm(n = n_k, mu = mu[[k]], Sigma = Sigma[[k]])
+    colnames(X_k)  <- paste0("X", seq_len(d))
+    # treatment
+    A_k            <- rbinom(n = n_k, size = 1, prob = p_k[k])
+    # potential outcomes
+    Y_0            <- as.vector(c_0 + d_k[k] + X_k %*% beta_0 + rnorm(n_k, sd = sigma_0))
+    Y_1            <- as.vector(c_1 + d_k[k] + X_k %*% beta_1 + rnorm(n_k, sd = sigma_1))
+    # observed outcome
+    Y_k            <- A_k * Y_1 + (1 - A_k) * Y_0
+    data_list[[k]] <- data.frame(A = A_k, Y = Y_k, X_k)
+    Y_0_list[[k]]  <- Y_0
+    Y_1_list[[k]]  <- Y_1
+    # site-level ATE
+    tau_k[k]       <- delta_c + sum(mu[[k]] * delta_beta)
+  }
+
+  list(
+    data     = data_list,
+    true_ate = sum(n * tau_k) / sum(n),
+    Y_0      = Y_0_list,
+    Y_1      = Y_1_list
+  )
+}
+```
+
+- **`centralised_ate()`** computes the plug-in G-formula estimator @eq-pluggin_gformula in a centralised fashion, i.e., with access to the full dataset (not partitioned among servers), with the option to include study effects.
+
+```{r helper-centralised-ate}
+#| code-fold: true
+#| code-summary: "Show `centralised_ate()`"
+centralised_ate <- function(data_list, outcome_name, treatment_name,
+                             covariate_names, study_effects = FALSE) {
+  K      <- length(data_list)
+  pooled <- do.call(rbind, data_list)
+
+  if (study_effects)
+    pooled$study_id <- factor(rep(seq_len(K), times = vapply(data_list, nrow, integer(1L))))
+
+  rhs         <- c(covariate_names, if (study_effects) "study_id")
+  rhs_formula <- reformulate(rhs)
+  formula     <- reformulate(rhs, response = outcome_name)
+
+  is_treated <- pooled[[treatment_name]] == 1
+  hat_theta1 <- glm(formula, gaussian, pooled[is_treated,  ])
+  hat_theta0 <- glm(formula, gaussian, pooled[!is_treated, ])
+  X_all      <- model.matrix(rhs_formula, data = pooled)
+  g          <- colMeans(X_all)
+
+  list(
+    ate           = as.numeric(g %*% (coef(hat_theta1) - coef(hat_theta0))),
+    hat_theta1    = hat_theta1,
+    hat_theta0    = hat_theta0,
+    X_all         = X_all,
+    treatment_vec = pooled[[treatment_name]]
+  )
+}
+```
+
+- **`centralised_variance()`** computes the variance according to [Proposition 1](#sec-prop-asymp_var) in a centralised fashion, i.e., with access to the full dataset (not partitioned among servers), covering three options: heterogeneous/homogeneous covariate distributions, presence/absence of study effects, and heteroscedastic/homoscedastic arms corresponding to $\sigma_0 \neq \sigma_1$ and $\sigma_0 = \sigma_1$.
+
+```{r helper-centralised-variance}
+#| code-fold: true
+#| code-summary: "Show `centralised_variance()`"
+centralised_variance <- function(fit,
+                                  heterogeneous = TRUE,
+                                  heteroscedastic_arms = FALSE) {
+  hat_theta1  <- fit$hat_theta1
+  hat_theta0  <- fit$hat_theta0
+  X_all       <- fit$X_all
+  g           <- colMeans(X_all)
+  n           <- nrow(X_all)
+  delta_theta <- coef(hat_theta1) - coef(hat_theta0)
+
+  tau_i  <- as.numeric(X_all %*% delta_theta)
+  V_samp <- sum((tau_i - fit$ate)^2) / (n * (n - 1L))
+
+  if (heteroscedastic_arms) {
+    sigma2_1 <- sigma(hat_theta1)^2
+    sigma2_0 <- sigma(hat_theta0)^2
+  } else {
+    sigma2_1 <- sigma2_0 <- (deviance(hat_theta1) + deviance(hat_theta0)) /
+                            (df.residual(hat_theta1) + df.residual(hat_theta0))
+  }
+
+  if (heterogeneous) {
+    V_cov_1 <- summary(hat_theta1)$cov.unscaled
+    V_cov_0 <- summary(hat_theta0)$cov.unscaled
+    V_param <- as.numeric(g %*% (sigma2_1 * V_cov_1) %*% g) +
+               as.numeric(g %*% (sigma2_0 * V_cov_0) %*% g)
+  } else {
+    p_hat   <- mean(fit$treatment_vec == 1)
+    V_param <- sigma2_1 / (n * p_hat) + sigma2_0 / (n * (1 - p_hat))
+  }
+
+  V_samp + V_param
+}
+```
+
+- **`make_connections()`** creates a mock DSLite federation with one in-memory R object per site. The one thing worth flagging: `dsFedAte` methods must be registered manually on each mock server, since DSLite only auto-discovers `dsBase`.
+
+```{r helper-connections}
+#| code-fold: true
+#| code-summary: "Show `make_connections()`"
+make_connections <- function(data_list, privacy_level = "banana",
+                             nfilter_glm = 0.33) {
+
+  options(
+    datashield.privacyControlLevel = privacy_level,
+    nfilter.glm                    = nfilter_glm
+  )
+
+  # Silence DSLite's login/registration chatter.
+  suppressWarnings(suppressMessages({
+    K <- length(data_list)
+
+    # One DSLite server per site: load data, enable dsBase + dsFedAte,
+    # register the dsFedAte methods, park the server in .GlobalEnv.
+    for (k in seq_len(K)) {
+      srv <- DSLite::newDSLiteServer(tables = list(study_data = data_list[[k]]))
+      srv$config(DSLite::defaultDSConfiguration(include = c("dsBase", "dsFedAte")))
+      srv$option("nfilter.glm", nfilter_glm)
+      srv$aggregateMethod("localAteDS", "localAteDS")
+      srv$assignMethod("addStudyIdDS", "addStudyIdDS")
+      assign(paste0(".dslite_srv_", k), srv, envir = .GlobalEnv)
+    }
+
+    # Describe the K logins (URLs and credentials in deployment).
+    builder <- DSI::newDSLoginBuilder()
+    for (k in seq_len(K))
+      builder$append(
+        server = paste0("study", k),
+        url    = paste0(".dslite_srv_", k),
+        table  = "study_data",
+        driver = "DSLiteDriver"
+      )
+
+    # Log in and name each site's table `base` on the server.
+    conns <- DSI::datashield.login(logins = builder$build(), assign = FALSE)
+    DSI::datashield.assign.table(conns = conns, table = "study_data", symbol = "base")
+    conns
+  }))
+}
+```
+
+- **`run_coverage()`** repeatedly simulates data (via `generate_data()`), fits the centralised estimator, and checks whether the true ATE lies inside the 95% delta-method confidence interval. Returns the empirical coverage over `n_rep` replications.
+
+```{r helper-run-coverage}
+#| code-fold: true
+#| code-summary: "Show `run_coverage()`"
+run_coverage <- function(n_rep, n_k, p_k, mu, Sigma,
+                         d_k = rep(0, K), sigma_0 = 1, sigma_1 = 1,
+                         heterogeneous = TRUE,
+                         heteroscedastic_arms = FALSE,
+                         study_effects = FALSE) {
+  covered <- vapply(seq_len(n_rep), function(i) {
+    sim <- generate_data(
+      K = K, d = d, n = n_k, p_k = p_k,
+      c_0 = c_0, c_1 = c_1, beta_0 = beta_0, beta_1 = beta_1,
+      mu = mu, Sigma = Sigma, d_k = d_k, sigma_0 = sigma_0, sigma_1 = sigma_1,
+      seed = i
+    )
+    fit <- suppressWarnings(
+      centralised_ate(sim$data, outcome_name, treatment_name, covariate_names,
+                      study_effects = study_effects)
+    )
+    variance <- centralised_variance(fit,
+                                     heterogeneous        = heterogeneous,
+                                     heteroscedastic_arms = heteroscedastic_arms)
+    se       <- sqrt(variance)
+    CI_lower <- fit$ate - 1.96 * se
+    CI_upper <- fit$ate + 1.96 * se
+    sim$true_ate >= CI_lower & sim$true_ate <= CI_upper
+  }, logical(1))
+  mean(covered)
+}
+```
+
+```{r helper-report}
+#| code-fold: true
+#| code-summary: "Show `report_ate()` / `verify_against_centralised()`"
+report_ate <- function(label, r, true_ate) {
+  cat(sprintf("%s ATE: %.4f  bias: %+.4f  SE: %.4f  95%% CI: [%.4f, %.4f]\n",
+              label, r$ate, r$ate - true_ate, sqrt(r$variance),
+              r$ci_lower, r$ci_upper))
+}
+
+verify_against_centralised <- function(pooled, pooled_variance, federated) {
+  cat(sprintf("Centralised ATE: %.4f  SE: %.4f\n",
+              pooled$ate, sqrt(pooled_variance)))
+  cat("ATE equal:     ", isTRUE(all.equal(pooled$ate,     federated$ate)),      "\n")
+  cat("Var equal:     ", isTRUE(all.equal(pooled_variance, federated$variance)), "\n")
+}
+```
+
+## Example 1 — Homogeneous populations {#sec-homogeneous}
+
+Five sites with balanced sample sizes ($n_k = 200$), sharing the same covariate distribution --- that is, $X \mid H = k \sim \mathcal{N}(\mu_X, \Sigma_X)$ for all $k \in [K]$ --- and no site effects (`study_effects = FALSE`). Treatment probabilities differ across sites, $p_k = (0.65, 0.65, 0.65, 0.35, 0.35)$, but remain sufficiently far away from 0 and 1, so the GLM disclosure filter is satisfied. The outcome follows model @eq-linear_outcome_noStudy with homoscedastic arms (`heteroscedastic_arms = FALSE`), i.e., $\sigma_0 = \sigma_1 = 1$. Each site is assumed to recruit from the same population (`heterogeneous = FALSE`); in the DAG of @fig-dag_het_center, this corresponds to removing both the dashed arc ($H \to Y$) and the dotted arc ($H \to X$).
+
+This section verifies that the federated estimator exactly matches its centralised counterpart, and similarly for the variances. It then demonstrates that the variance formula in @eq-variance_homogeneous achieves nominal coverage across 2000 fresh replications of this setting.
+
+[**Generate data.**]{style="font-weight:700"}
+
+```{r ex1-data}
+mu_X    <- c(rep(1, d / 2), rep(-1, d / 2))
+Sigma_X <- 0.5 * I_d + 0.5 * J
+
+sim_1 <- generate_data(
+  K = K, d = d, n = 20 * d, p_k = c(0.65, 0.65, 0.65, 0.35, 0.35),
+  c_0 = c_0, c_1 = c_1, beta_0 = beta_0, beta_1 = beta_1,
+  mu = mu_X, Sigma = Sigma_X,
+  seed = 123
+)
+```
+
+[**Connect and estimate.**]{style="font-weight:700"}
+
+```{r ex1-estimate}
+conns_1 <- make_connections(sim_1$data)
+
+result_1 <- ds.EstimateAte(
+  datasources     = conns_1,
+  base_name       = "base",
+  outcome_name    = outcome_name,
+  treatment_name  = treatment_name,
+  covariate_names = covariate_names,
+  heterogeneous   = FALSE,
+  quiet           = TRUE
+)
+```
+
+[**Results.**]{style="font-weight:700"}
+
+```{r ex1-results}
+report_ate("Federated  ", result_1, sim_1$true_ate)
+```
+
+We verify numerical equality with the centralised estimate:
+
+```{r ex1-verify}
+pooled_1     <- centralised_ate(sim_1$data, outcome_name, treatment_name,
+                                 covariate_names)
+pooled_1_var <- centralised_variance(pooled_1, heterogeneous = FALSE)
+verify_against_centralised(pooled_1, pooled_1_var, result_1)
+```
+
+[**Coverage.**]{style="font-weight:700"} We check that the 95% CI achieves nominal coverage over 2000 fresh replications of this setting:
+
+```{r ex1-coverage}
+cov_1 <- run_coverage(
+  n_rep = 2000,
+  n_k   = 20 * d, p_k = c(0.65, 0.65, 0.65, 0.35, 0.35),
+  mu    = mu_X,   Sigma = Sigma_X,
+  heterogeneous = FALSE
+)
+cat(sprintf("Empirical coverage: %.1f%%\n", 100 * cov_1))
+```
+
+```{r ex1-logout, include = FALSE}
+DSI::datashield.logout(conns_1)
+```
+
+## Example 2 — Disclosure thresholds and privacy levels {#sec-privacy}
+
+Same model parameters as Example 1, but with extreme treatment probabilities $p_k = (0.9, 0.9, 0.9, 0.1, 0.1)$. With $n_k = 200$ and $p = 0.1$, the minority arm contains only 20 observations in expectation. This example illustrates two independent DataSHIELD disclosure controls --- an insufficiently low disclosure threshold and an `"avocado"` privacy level --- each triggered by a different operator setting, that can prevent estimation entirely.
+
+[**Generate data.**]{style="font-weight:700"}
+
+```{r ex2-data}
+sim_2 <- generate_data(
+  K = K, d = d, n = 20 * d, p_k = c(0.9, 0.9, 0.9, 0.1, 0.1),
+  c_0 = c_0, c_1 = c_1, beta_0 = beta_0, beta_1 = beta_1,
+  mu = mu_X, Sigma = Sigma_X,
+  seed = 7
+)
+```
+
+[**Guard 1 — GLM disclosure threshold (`nfilter.glm` = 0.33) — estimation blocked.**]{style="font-weight:700"}
+
+`ds.EstimateAte` subsets data into arm-specific objects via `dataFrameSubsetDS2`, then
+fits an arm-specific OLS via `glmDS2`.  The latter enforces
+$d + 1 \leq \texttt{nfilter.glm} \times n_{k}^{(a)}$.  Each site has $n_k = 200$
+observations and the minority arm is assigned with probability $p = 0.1$, giving an
+expected minority arm size of $20$.
+With $d + 1 = 11$ parameters, the default threshold $0.33$ blocks the call because
+$11 > 0.33 \times 20 = 6.6$.
+
+```{r ex2-nfilter-blocked, error = TRUE}
+conns_2 <- make_connections(sim_2$data, privacy_level = "banana", nfilter_glm = 0.33)
+
+ds.EstimateAte(
+  datasources     = conns_2,
+  base_name       = "base",
+  outcome_name    = outcome_name,
+  treatment_name  = treatment_name,
+  covariate_names = covariate_names,
+  heterogeneous   = FALSE
+)
+```
+
+```{r ex2-logout-1, include = FALSE}
+DSI::datashield.logout(conns_2)
+```
+
+[**Guard 1 resolved — raised threshold (`nfilter.glm` = 0.6) — estimation succeeds.**]{style="font-weight:700"}
+
+Raising `nfilter.glm` to $0.6 > 11/20 = 0.55$ satisfies the threshold.  The estimate
+comes through with a larger standard error than Example 1 because extreme arm imbalance
+reduces effective sample size.
+
+```{r ex2-nfilter-resolved}
+conns_2 <- make_connections(sim_2$data, privacy_level = "banana", nfilter_glm = 0.6)
+
+result_2 <- ds.EstimateAte(
+  datasources     = conns_2,
+  base_name       = "base",
+  outcome_name    = outcome_name,
+  treatment_name  = treatment_name,
+  covariate_names = covariate_names,
+  heterogeneous   = FALSE,
+  quiet           = TRUE
+)
+```
+
+```{r ex2-results}
+report_ate("Federated  ", result_2, sim_2$true_ate)
+```
+
+```{r ex2-logout-2, include = FALSE}
+DSI::datashield.logout(conns_2)
+```
+
+[**Guard 2 — Privacy level `"avocado"` — subsetting blocked.**]{style="font-weight:700"}
+
+The `"avocado"` level blocks known subsetting attacks, so `dataFrameSubsetDS2` is not
+permitted under it.  Because subsetting occurs *before* (see @fig-dataflow) both the GLM and the `localAteDS`
+stages, the error originates from `dataFrameSubsetDS2`.  Raising `nfilter.glm` does not help since the GLM stage is
+never reached.
+
+```{r ex2-avocado-blocked, error = TRUE}
+conns_2 <- make_connections(sim_2$data, privacy_level = "avocado", nfilter_glm = 0.6)
+
+ds.EstimateAte(
+  datasources     = conns_2,
+  base_name       = "base",
+  outcome_name    = outcome_name,
+  treatment_name  = treatment_name,
+  covariate_names = covariate_names,
+  heterogeneous   = FALSE
+)
+```
+
+```{r ex2-logout-3, include = FALSE}
+DSI::datashield.logout(conns_2)
+```
+
+Switching back to `"banana"` with `nfilter.glm` = 0.6 — as in the block above — restores
+estimation.
+
+## Example 3 — Heterogeneous covariate distributions {#sec-heterogeneous}
+
+Five sites with unbalanced sample sizes ($n_1 = 600$, $n_2 = \ldots = n_5 = 120$),
+each recruiting from a distinct patient population: the covariate mean $\mu_k$ and
+covariance $\Sigma_k$ vary across sites, so $X \mid H = k \sim \mathcal{N}(\mu_k,
+\Sigma_k)$. Treatment probabilities are the same as Example 1, $p_k = (0.65, 0.65, 0.65, 0.35, 0.35)$; even the
+smallest sites have an expected minority arm size of $0.35 \times 120 = 42 > 33$, so
+the default `"banana"` settings apply. The outcome follows model @eq-linear_outcome_noStudy
+with no site effects (`study_effects = FALSE`) and homoscedastic arms (`heteroscedastic_arms = FALSE`).
+Each site recruits from a different population (`heterogeneous = TRUE`); in the DAG of @fig-dag_het_center, this corresponds to
+removing the dashed arc ($H \to Y$) while keeping the dotted arc ($H \to X$).
+
+Under distributional shift
+the homogeneous variance formula is no longer valid; the formula in
+@eq-variance_heterogeneous_NostudyEffect must be used instead. Similar to Example 1, this section verifies
+that the federated estimator matches its centralised counterpart and that the
+heterogeneous variance formula achieves nominal 95% coverage across 2000 fresh replications.
+
+[**Define site-specific distributions.**]{style="font-weight:700"}
+
+```{r ex3-distributions}
+mu_list <- list(
+  c(rep( 1.0, d / 2), rep(-1.0, d / 2)),
+  c(rep(-1.0, d / 2), rep( 1.0, d / 2)),
+  rep(0, d),
+  c(rep( 0.5, d / 2), rep(-1.0, d / 2)),
+  c(rep( 1.2, d / 2), rep( 0.8, d / 2))
+)
+
+Sigma_1    <- 0.5 * I_d + 0.5 * J
+Sigma_list <- list(
+  Sigma_1,
+  20 * Sigma_1 + 0.5 * I_d - 0.5 * J,
+   0.02 * Sigma_1 + 0.7  * I_d,
+   1.0  * Sigma_1 + 0.5  * I_d - 0.15 * J,
+   1.5  * Sigma_1 + 0.5  * I_d - 0.15 * J
+)
+```
+
+[**Generate data.**]{style="font-weight:700"}
+
+```{r ex3-data}
+sim_3 <- generate_data(
+  K = K, d = d, n = c(600, 120, 120, 120, 120), p_k = c(0.65, 0.65, 0.65, 0.35, 0.35),
+  c_0 = c_0, c_1 = c_1, beta_0 = beta_0, beta_1 = beta_1,
+  mu = mu_list, Sigma = Sigma_list,
+  seed = 123
+)
+```
+
+[**Connect and estimate.**]{style="font-weight:700"}
+
+```{r ex3-estimate}
+conns_3 <- make_connections(sim_3$data)
+
+result_3 <- ds.EstimateAte(
+  datasources     = conns_3,
+  base_name       = "base",
+  outcome_name    = outcome_name,
+  treatment_name  = treatment_name,
+  covariate_names = covariate_names,
+  heterogeneous   = TRUE,
+  quiet           = TRUE
+)
+```
+
+[**Results.**]{style="font-weight:700"}
+
+```{r ex3-results}
+report_ate("Federated  ", result_3, sim_3$true_ate)
+```
+
+```{r ex3-verify}
+pooled_3     <- centralised_ate(sim_3$data, outcome_name, treatment_name,
+                                 covariate_names)
+pooled_3_var <- centralised_variance(pooled_3, heterogeneous = TRUE)
+verify_against_centralised(pooled_3, pooled_3_var, result_3)
+```
+
+[**Coverage.**]{style="font-weight:700"} We check that the 95% CI achieves nominal coverage over 2000 fresh replications of this setting:
+
+```{r ex3-coverage}
+cov_3 <- run_coverage(
+  n_rep = 2000,
+  n_k   = c(600, 120, 120, 120, 120),
+  p_k   = c(0.65, 0.65, 0.65, 0.35, 0.35),
+  mu    = mu_list, Sigma = Sigma_list,
+  heterogeneous = TRUE
+)
+cat(sprintf("Empirical coverage: %.1f%%\n", 100 * cov_3))
+```
+
+```{r ex3-logout, include = FALSE}
+DSI::datashield.logout(conns_3)
+```
+
+## Example 4 — Study effects {#sec-confounding}
+
+Five sites with unbalanced sample sizes ($n_1 = 600$, $n_2 = \ldots = n_5 = 300$),
+using the same site-specific covariate distributions as Example 3. Treatment
+probabilities are the same as Example 1, $p_k = (0.65, 0.65, 0.65, 0.35, 0.35)$; the smallest sites have an
+expected minority arm size of $0.35 \times 300 = 105 \gg 33$, so the default
+`"banana"` settings apply. The outcome follows model @eq-linear_outcome with
+site effects $d_k = (1, 2, -1, 30, 2)$ (`study_effects = TRUE`) and heteroscedastic
+arms $\sigma_0 = 0.5$, $\sigma_1 = 3.0$ (`heteroscedastic_arms = TRUE`). Each site
+recruits from a different population (`heterogeneous = TRUE`); in the DAG of
+@fig-dag_het_center, both arcs are present: the dashed arc ($H \to Y$, via $d_k$)
+and the dotted arc ($H \to X$).
+
+Because $d_k$ enters both potential outcomes equally it does not change the true ATE
+— the shift cancels in $Y^{(1)} - Y^{(0)}$ — but when a site with a large shift
+($d_4 = 30$) also has lower treatment probability ($p_4 = 0.35$), the unadjusted
+estimator conflates the site shift with the treatment effect. Augmenting the design
+matrix with $K - 1$ site-membership dummies absorbs the shifts (`study_effects = TRUE`).
+This section shows the bias of the unadjusted estimator, verifies that the adjusted
+estimator recovers the true ATE, and confirms nominal 95% coverage across 2000 fresh
+replications.
+
+[**Generate data.**]{style="font-weight:700"}
+
+```{r ex4-data}
+sim_4 <- generate_data(
+  K = K, d = d, n = c(600, 300, 300, 300, 300), p_k = c(0.65, 0.65, 0.65, 0.35, 0.35),
+  c_0 = c_0, c_1 = c_1, beta_0 = beta_0, beta_1 = beta_1,
+  mu = mu_list, Sigma = Sigma_list,
+  d_k     = c(1, 2, -1, 30, 2),
+  sigma_0 = 0.5, sigma_1 = 3.0,
+  seed = 123
+)
+```
+
+[**Connect.**]{style="font-weight:700"}
+
+```{r ex4-connect, message = FALSE}
+conns_4 <- make_connections(sim_4$data)
+```
+
+[**Unadjusted — biased.**]{style="font-weight:700"}
+
+With `study_effects = FALSE`, the design matrix contains only the $d$ covariates $X$; the site-intercept shifts $d_k$ are omitted from the regression. This leads to a biased estimator.
+
+```{r ex4-unadj}
+result_4_unadj <- ds.EstimateAte(
+  datasources     = conns_4,
+  base_name       = "base",
+  outcome_name    = outcome_name,
+  treatment_name  = treatment_name,
+  covariate_names = covariate_names,
+  study_effects   = FALSE,
+  heterogeneous   = TRUE,
+  quiet           = TRUE
+)
+```
+
+```{r ex4-unadj-results}
+cat(sprintf("Unadjusted ATE: %.4f   bias: %+.4f   (true ATE: %.4f)\n",
+            result_4_unadj$ate,
+            result_4_unadj$ate - sim_4$true_ate,
+            sim_4$true_ate))
+```
+
+[**Adjusted — unbiased.**]{style="font-weight:700"}
+
+```{r ex4-adj}
+result_4_adj <- ds.EstimateAte(
+  datasources          = conns_4,
+  base_name            = "base",
+  outcome_name         = outcome_name,
+  treatment_name       = treatment_name,
+  covariate_names      = covariate_names,
+  study_effects        = TRUE,
+  heterogeneous        = TRUE,
+  heteroscedastic_arms = TRUE,
+  quiet                = TRUE
+)
+```
+
+```{r ex4-adj-results}
+cat(sprintf(
+  "  Adjusted ATE: %.4f   bias: %+.4f   SE: %.4f   95%% CI: [%.4f, %.4f]\n",
+  result_4_adj$ate, result_4_adj$ate - sim_4$true_ate,
+  sqrt(result_4_adj$variance), result_4_adj$ci_lower, result_4_adj$ci_upper
+))
+```
+
+The adjusted estimate recovers the true ATE and the 95% CI covers it.
+
+[**Verify equality with centralised adjusted analysis.**]{style="font-weight:700"}
+
+```{r ex4-verify}
+pooled_4     <- centralised_ate(sim_4$data, outcome_name, treatment_name,
+                                 covariate_names, study_effects = TRUE)
+pooled_4_var <- centralised_variance(pooled_4,
+                                      heterogeneous        = TRUE,
+                                      heteroscedastic_arms = TRUE)
+verify_against_centralised(pooled_4, pooled_4_var, result_4_adj)
+```
+
+[**Coverage.**]{style="font-weight:700"} We check that the 95% CI achieves nominal coverage over 2000 fresh replications of this setting:
+
+```{r ex4-coverage}
+cov_4 <- run_coverage(
+  n_rep = 2000,
+  n_k   = c(600, 300, 300, 300, 300),
+  p_k   = c(0.65, 0.65, 0.65, 0.35, 0.35),
+  mu    = mu_list, Sigma = Sigma_list,
+  d_k   = c(1, 2, -1, 30, 2), sigma_0 = 0.5, sigma_1 = 3.0,
+  heterogeneous = TRUE, heteroscedastic_arms = TRUE, study_effects = TRUE
+)
+cat(sprintf("Empirical coverage: %.1f%%\n", 100 * cov_4))
+```
+
+```{r ex4-logout, include = FALSE}
+DSI::datashield.logout(conns_4)
+```
+
+## Example 5 — Consistency under model misspecification {#sec-misspec}
+
+Examples 1--4 all assumed a linear outcome model, which matched the data-generating
+process by construction. This final example demonstrates a stronger result: the
+plug-in G-formula estimator obtained by regressing on $X$ and $H$ remains
+consistent for the ATE even when the true outcome model is nonlinear---the
+content of [Proposition 2](#sec-prop-misspecified_model_consistent_ate).
+
+We retain the covariate and treatment-assignment structure of Example 3 —
+heterogeneous covariates and treatment probabilities $p_k = (0.65, 0.65, 0.65,
+0.35, 0.35)$ — but now generate a binary outcome via a logistic model,
+\begin{equation}
+    Y^{a} \mid X = x,\, H = k \;\sim\; \mathrm{Bernoulli}\!\bigl(\sigma(c_a + x^\top \beta_a)\bigr),
+\end{equation}
+
+so the linear G-formula is now misspecified. The outcome-model coefficients
+$(c_a, \beta_a)$ used here are rescaled from the shared parameters so that the
+linear predictor stays in the sensitive range of the logistic link and the
+resulting ATE is of practical magnitude:
+
+```{r ex5-params}
+c_0_ex5    <- 0
+c_1_ex5    <- 2
+beta_0_ex5 <- 0.5 * beta_0
+beta_1_ex5 <- 0.5 * beta_1
+p_k_ex5    <- c(0.65, 0.65, 0.65, 0.35, 0.35)
+```
+
+Although the data generating process has no site effects, `study_effects = TRUE` must still be passed to `centralised_ate()`, or, in a federated setting, to `ds.EstimateAte()`.
+
+[**True ATE.**]{style="font-weight:700"}  Computed by Monte Carlo on a very large draw:
+
+```{r ex5-truth}
+# Reference ATE from a large Monte Carlo draw
+sim_truth <- generate_data(
+  K = K, d = d, n = 5000 * c(600, 120, 120, 120, 120),
+  p_k = p_k_ex5,
+  c_0 = c_0_ex5, c_1 = c_1_ex5, beta_0 = beta_0_ex5, beta_1 = beta_1_ex5,
+  mu = mu_list, Sigma = Sigma_list,
+  sigma_0 = 0, sigma_1 = 0,
+  seed = 999
+)
+tau_true <- mean(plogis(unlist(sim_truth$Y_1)) - plogis(unlist(sim_truth$Y_0)))
+cat(sprintf("Monte Carlo true ATE: %.5f\n", tau_true))
+```
+
+[**Simulation.**]{style="font-weight:700"}  For each total sample size $n$, we approximate the MSE by
+averaging the squared bias over 2000 Monte Carlo replications. Each replication
+generates a dataset, overwrites each site's `Y` with Bernoulli draws from the
+logistic model, and fits the linear G-formula with `study_effects = TRUE`:
+
+```{r ex5-sim}
+n_base   <- c(600, 120, 120, 120, 120)
+n_scale  <- c(0.5, 1, 2, 5, 10)
+n_tot    <- n_scale * sum(n_base)
+n_rep    <- 2000
+
+# Overwrite each site's Y with Bernoulli draws from the logistic model.
+# This is the step that makes the linear G-formula misspecified.
+binarize_outcome <- function(sim) {
+  for (k in seq_along(sim$data)) {
+    A_k <- sim$data[[k]]$A
+    eta <- A_k * sim$Y_1[[k]] + (1 - A_k) * sim$Y_0[[k]]
+    sim$data[[k]]$Y <- rbinom(length(eta), 1, plogis(eta))
+  }
+  sim$data
+}
+
+# One replication: generate -> binarize -> estimate -> return bias.
+simulate_bias <- function(n_vec, seed) {
+  sim <- generate_data(
+    K = K, d = d, n = n_vec, p_k = p_k_ex5,
+    c_0 = c_0_ex5, c_1 = c_1_ex5, beta_0 = beta_0_ex5, beta_1 = beta_1_ex5,
+    mu = mu_list, Sigma = Sigma_list,
+    sigma_0 = 0, sigma_1 = 0, seed = seed
+  )
+  set.seed(seed + 1e6)
+  fit <- suppressWarnings(
+    centralised_ate(binarize_outcome(sim), outcome_name, treatment_name,
+                    covariate_names, study_effects = TRUE)
+  )
+  fit$ate - tau_true
+}
+
+bias_mat <- vapply(seq_along(n_scale), function(j) {
+  vapply(seq_len(n_rep),
+         function(r) simulate_bias(n_scale[j] * n_base, r + 1000 * j),
+         numeric(1))
+}, numeric(n_rep))
+
+sq_err    <- bias_mat^2
+mse       <- colMeans(sq_err)
+se_mse    <- apply(sq_err, 2, sd) / sqrt(n_rep)
+mse_lower <- mse - 1.96 * se_mse
+mse_upper <- mse + 1.96 * se_mse
+```
+
+[**MSE vs $n$.**]{style="font-weight:700"}  On a log-log scale the empirical MSE falls along a straight line
+of slope $-1$, i.e., $\mathrm{MSE} \propto n^{-1}$, as expected for a
+$\sqrt{n}$-consistent estimator. Vertical bars are 95% normal confidence intervals
+around each MSE:
+
+```{r ex5-plot}
+#| fig-cap: "Empirical MSE of the federated ATE estimator as a function of total sample size (log-log scale), under a logistic data-generating process.  Vertical bars are 95% normal confidence intervals around each MSE; the dashed line is the $n^{-1}$ reference anchored at the smallest $n$."
+plot(n_tot, mse, log = "xy", type = "b", pch = 19,
+     xlab = "Total sample size n", ylab = "MSE",
+     ylim = range(c(mse_lower, mse_upper)))
+arrows(n_tot, mse_lower, n_tot, mse_upper,
+       length = 0.03, angle = 90, code = 3)
+curve(mse[1] * (x / n_tot[1])^(-1),
+      from = min(n_tot), to = max(n_tot),
+      add = TRUE, lty = 2, col = "red")
+legend("topright",
+       legend = c("Empirical MSE", expression(n^{-1} ~ "reference")),
+       lty    = c(1, 2), pch = c(19, NA), col = c("black", "red"),
+       bty    = "n")
+```
+
+::: {.callout-note collapse="true"}
+## Show bias–variance decomposition
+
+The MSE above decomposes as $\mathrm{MSE} = \mathrm{Bias}^2 + \mathrm{Var}$. The two
+panels below plot the components of that decomposition: on the left, the empirical
+absolute bias $|\bar{\hat\tau} - \tau|$, whose magnitude stays below the Monte
+Carlo resolution at every $n$ — consistent with the estimator's finite-sample
+bias being far smaller than its variance, as expected for a consistent estimator
+under misspecification — and on the right, the empirical variance, which tracks
+the $n^{-1}$ reference and dominates the MSE at every sample size.
+
+```{r ex5-bias-var-plot}
+#| fig-cap: "Monte Carlo decomposition of the MSE above. Left: absolute empirical bias $|\\bar{\\hat\\tau} - \\tau|$ versus total sample size (log-log). Right: empirical variance versus total sample size, with the $n^{-1}$ reference anchored at the smallest $n$."
+#| fig-width: 8
+#| fig-height: 4
+abs_bias <- abs(colMeans(bias_mat))
+var_hat  <- apply(bias_mat, 2, var)
+
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+
+plot(n_tot, abs_bias, log = "xy", type = "b", pch = 19,
+     xlab = "Total sample size n", ylab = "|empirical bias|",
+     main = "Bias")
+
+plot(n_tot, var_hat, log = "xy", type = "b", pch = 19,
+     xlab = "Total sample size n", ylab = "Variance",
+     main = "Variance")
+curve(var_hat[1] * (x / n_tot[1])^(-1),
+      from = min(n_tot), to = max(n_tot),
+      add = TRUE, lty = 2, col = "red")
+legend("topright",
+       legend = c("Empirical variance", expression(n^{-1} ~ "reference")),
+       lty    = c(1, 2), pch = c(19, NA), col = c("black", "red"),
+       bty    = "n")
+```
+
+:::
+
+## Coverage summary {#sec-coverage}
+
+The three per-example coverage checks reported in @sec-homogeneous, @sec-heterogeneous, and @sec-confounding are collected below. All sit near the nominal 95%, confirming that the  variance in [Proposition 1](#sec-prop-asymp_var) yields well-calibrated intervals across the simulation settings considered here.
+
+```{r coverage-summary}
+#| echo: false
+knitr::kable(
+  data.frame(
+    Setting  = c("Homogeneous (Example 1)",
+                 "Heterogeneous covariates (Example 3)",
+                 "Study effects + heteroscedastic arms (Example 4)"),
+    Coverage = sprintf("%.1f%%", 100 * c(cov_1, cov_3, cov_4))
+  ),
+  caption = "Empirical 95% CI coverage over 2000 replications per setting."
+)
+```
+

@@ -1,0 +1,84 @@
+project:
+  type: default
+  render:
+    - main.qmd
+    - README.qmd
+
+title: "Federated Average Treatment Effect Estimation for Multi-Site RCTs with DataSHIELD"
+affiliations:
+  - id: premedical
+    name: "PreMeDICaL, Inria, Inserm, Idesp, UMR 1318, Université de Montpellier"
+    city: Montpellier
+    country: France
+  - id: heka
+    name: "UMR1346, HeKA, Inserm, Inria, Université Paris Cité"
+    city: Paris
+    country: France
+author:
+  - name:
+      literal: "Francisco Andrade†"
+      family: Andrade
+      given: Francisco
+    corresponding: true
+    email: francisco.de-lima-andrade@inria.fr
+    affiliations:
+      - ref: premedical
+      - ref: heka
+  - name:
+      literal: "Rémi Khellaf†"
+      family: Khellaf
+      given: Rémi
+    affiliations:
+      - ref: premedical
+  - name: Julie Josse
+    affiliations:
+      - ref: premedical
+date: last-modified
+date-modified: last-modified
+abstract: >+
+  We introduce `dsFedAte` and `dsFedAteClient`, two companion R packages for
+  federated estimation of the average treatment effect (ATE) from multiple
+  randomized controlled trials (RCTs), without sharing individual-level data.
+  Built on the open-source DataSHIELD privacy-preserving infrastructure, they
+  implement a covariate-adjusted G-formula estimator accommodating heterogeneous
+  covariate distributions and study effects. Unlike iterative federated
+  optimization methods, our approach fits arm-specific linear outcome models in
+  a single communication round by aggregating local sufficient statistics,
+  yielding estimates identical to those obtained from centrally pooled data.
+  The entire analysis is accessible through a single client-side function,
+  `ds.EstimateAte()`.
+
+  Beyond implementation, we also present methodological contributions. First,
+  we derive the asymptotic variance of the ATE estimator, accounting for
+  heterogeneous covariate distributions and study effects, and express its
+  estimator in terms of locally aggregable quantities, enabling federated
+  confidence intervals equivalent to those obtained from pooled data. Second,
+  we establish consistency and asymptotic normality under misspecified linear
+  outcome models, showing that covariate adjustment is asymptotically at least
+  as efficient as the unadjusted stratified difference-in-means estimator.
+
+  We illustrate the packages through reproducible examples using the DSLite
+  simulation environment, covering homogeneous and heterogeneous populations,
+  DataSHIELD disclosure controls, and adjustment for study effects. A simulation
+  study validates the theoretical results and demonstrates nominal confidence
+  interval coverage.
+
+keywords: [federated learning, causal inference, average treatment effect, DataSHIELD, R package, privacy-preserving statistics, multi-site RCT]
+bibliography: references.bib
+github-user: FranciscoAndrade90
+repo: "fedate-datashield"
+status: "submitted"
+citation:
+  type: article-journal
+  container-title: "Computo"
+  issn: "2824-7795"
+  doi: "10.5072/computo.0000" # placeholder DOI (10.5072 is the official DOI test prefix), replace once assigned
+  # set at acceptance, with the published repository name (used by Google Scholar):
+  # url: "https://computo-journal.org/published-YYYYMM-name/"
+  # pdf-url: "https://computo-journal.org/published-YYYYMM-name/main.pdf"
+license: CC-BY-4.0
+format:
+  computo-html:
+    embed-resources: true
+    code-fold: false
+  computo-pdf: default
