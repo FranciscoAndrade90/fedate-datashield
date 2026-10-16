@@ -59,6 +59,39 @@
       "RemoteRef": "master",
       "RemoteSha": "5196cff6b789ca64829bc5563572f498793568b1"
     },
+    "DSLite": {
+      "Package": "DSLite",
+      "Version": "1.4.1",
+      "Source": "Repository",
+      "Type": "Package",
+      "Title": "'DataSHIELD' Implementation on Local Datasets",
+      "Authors@R": "c(person(given = \"Yannick\", family = \"Marcon\", role = c(\"aut\", \"cre\"), email = \"yannick.marcon@obiba.org\", comment = c(ORCID = \"0000-0003-0138-2023\")))",
+      "Depends": [
+        "R (>= 3.5.0)",
+        "DSI (>= 1.5)",
+        "methods",
+        "R6",
+        "rly"
+      ],
+      "Suggests": [
+        "resourcer",
+        "knitr",
+        "testthat",
+        "rmarkdown"
+      ],
+      "Description": "'DataSHIELD' is an infrastructure and series of R packages that  enables the remote and 'non-disclosive' analysis of sensitive research data. This 'DataSHIELD Interface' implementation is for analyzing datasets living in the current R session. The purpose of this is primarily for lightweight 'DataSHIELD' analysis package development.",
+      "License": "LGPL (>= 2.1)",
+      "URL": "https://github.com/datashield/DSLite/, https://datashield.github.io/DSLite/, https://datashield.org/, https://doi.org/10.1093/ije/dyu188",
+      "BugReports": "https://github.com/datashield/DSLite/issues/",
+      "RoxygenNote": "7.3.2",
+      "VignetteBuilder": "knitr",
+      "Encoding": "UTF-8",
+      "Collate": "'DSLiteDriver.R' 'DSLiteConnection.R' 'DSLiteResult.R' 'DSLiteServer.R' 'ast.R' 'data.cnsim.R' 'data.dasim.R' 'data.discordant.R' 'data.survival.R' 'data.testing.dataset.R' 'defaultDSConfiguration.R' 'getDSLiteData.R' 'lex-yacc.R' 'setupCNSIMTest.R' 'setupDASIMTest.R' 'setupDATASETTest.R' 'setupDISCORDANTTest.R' 'setupDSLiteServer.R' 'setupSURVIVALTest.R' 'testParse.R'",
+      "NeedsCompilation": "no",
+      "Author": "Yannick Marcon [aut, cre] (ORCID: <https://orcid.org/0000-0003-0138-2023>)",
+      "Maintainer": "Yannick Marcon <yannick.marcon@obiba.org>",
+      "Repository": "CRAN"
+    },
     "DescTools": {
       "Package": "DescTools",
       "Version": "0.99.60",
@@ -4347,6 +4380,38 @@
       "NeedsCompilation": "yes",
       "Author": "Lionel Henry [aut, cre], Hadley Wickham [aut], mikefc [cph] (Hash implementation based on Mike's xxhashlite), Yann Collet [cph] (Author of the embedded xxHash library), Posit, PBC [cph, fnd]",
       "Maintainer": "Lionel Henry <lionel@posit.co>",
+      "Repository": "CRAN"
+    },
+    "rly": {
+      "Package": "rly",
+      "Version": "1.7.8",
+      "Source": "Repository",
+      "Type": "Package",
+      "Title": "Tools to Create Formal Language Parser",
+      "Date": "2026-01-14",
+      "Authors@R": "c(person(\"Marek\", \"Jagielski\", role = c(\"aut\", \"cre\", \"cph\"), email = \"marek.jagielski@gmail.com\"), person(\"David M.\", \"Beazley\", role = c(\"aut\", \"cph\")), person(\"Yasutaka\", \"Tanaka\", role = c(\"ctb\")), person(\"Henrico\", \"Witvliet\", role = c(\"ctb\")))",
+      "Author": "Marek Jagielski [aut, cre, cph], David M. Beazley [aut, cph], Yasutaka Tanaka [ctb], Henrico Witvliet [ctb]",
+      "Maintainer": "Marek Jagielski <marek.jagielski@gmail.com>",
+      "Description": "R implementation of the common parsing tools 'lex' and 'yacc'.",
+      "License": "MIT + file LICENSE",
+      "URL": "https://github.com/systemincloud/rly",
+      "BugReports": "https://github.com/systemincloud/rly/issues",
+      "Suggests": [
+        "testthat",
+        "knitr",
+        "rmarkdown"
+      ],
+      "Encoding": "UTF-8",
+      "Depends": [
+        "R (>= 3.3.0)"
+      ],
+      "Imports": [
+        "R6"
+      ],
+      "RoxygenNote": "6.1.1",
+      "Collate": "'logger.R' 'lex.R' 'yacc.R' 'rly-package.R'",
+      "VignetteBuilder": "knitr",
+      "NeedsCompilation": "yes",
       "Repository": "CRAN"
     },
     "rmarkdown": {
