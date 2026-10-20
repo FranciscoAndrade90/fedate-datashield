@@ -16,6 +16,8 @@ We introduce two companion R packages, `dsFedAte` (server-side) and `dsFedAteCli
 
 We provide two methodological contributions, beyond the implementation. First, we derive the asymptotic variance in the general setting, accounting for heterogeneous covariate distributions and site effects. We express this variance as a sum of locally computable contributions that can be aggregated centrally, enabling federated variance estimation and the construction of confidence intervals. Second, we extend the known results of linear adjustment in a single RCT to the multiple RCTs setting. We also prove the consistency and asymptotic normality of the estimator even when the outcome models are estimated with misspecified linear regressions ([Proposition 2](#sec-prop-misspecified_model_consistent_ate)).
 
+Finally, our work contributes to a growing movement of theory-backed implementations for federated causal inference. A complementary approach is available in the `dsMatching` and `dsMatchingClient` DataSHIELD packages by @gusinow2026privacy, who operate in a multi-site observational data setting. Under the assumption of homogeneous nuisance functions across sites, they focus on the federated estimation of parametric propensity scores to derive matching-based estimators. In contrast, we operate within a multiple RCT setting with heterogeneous outcome distributions. We focus on federated g-formula estimators, accommodating site effects and guaranteeing robustness to model misspecification.
+
 # Background and Problem Statement {#sec-background}
 
 ## Multicenter Causal Inference {#sec-causal}
